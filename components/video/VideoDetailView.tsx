@@ -6,7 +6,7 @@ import { ArrowLeft } from "lucide-react";
 import { PlayerPanel } from "./PlayerPanel";
 import { SourcePanel } from "./SourcePanel";
 import { MomentsPanel } from "./MomentsPanel";
-import { TopicPanel } from "./TopicPanel";
+import { HighlightsPanel } from "./HighlightsPanel";
 import { useYoutubePlayer } from "./useYoutubePlayer";
 import type { SearchResult } from "@/lib/types";
 
@@ -32,7 +32,7 @@ export function VideoDetailView({ video, initialSeconds }: { video: SearchResult
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-4">
           <PlayerPanel video={video} containerRef={containerRef} initialSeconds={initialSeconds} />
-          <TopicPanel key={`${video.provider}:${video.id}`} video={video} seekTo={seekTo} playerReady={ready} onSaved={() => setSavedRevision((value) => value + 1)} />
+          <HighlightsPanel key={`${video.provider}:${video.id}`} video={video} seekTo={seekTo} playerReady={ready} onSaved={() => setSavedRevision((value) => value + 1)} />
         </div>
         <div className="space-y-4">
           <SourcePanel video={video} />

@@ -2,8 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { NextRequest, NextResponse } from "next/server";
-import { CreateAnalysisSchema, MAX_VIDEO_SECONDS, JOB_TTL_MS } from "@/lib/analysis/schema";
-import { analysisRoot, cancelJob, createJob, getJob, getProgress, listJobs } from "@/lib/analysis/store";
+import { CreateAnalysisSchema, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, clampWindowSeconds } from "@/lib/analysis/schema";
+import { analysisRoot, cancelJob, createJob, getJob, getProgress, isWorkerOnline, listJobs, requestRetry } from "@/lib/analysis/store";
 import { getYoutubeVideo } from "@/lib/youtube";
 
 export const runtime = "nodejs";
@@ -37,17 +37,18 @@ async function smallBody(request: NextRequest) {
 export async function GET(request: NextRequest) {
   const owner = ownerOf(request);
   const id = request.nextUrl.searchParams.get("id");
-  if (!id) return reply({ configured: Boolean(process.env.GEMINI_API_KEY && process.env.YOUTUBE_API_KEY), maxDurationSeconds: MAX_VIDEO_SECONDS });
+  const workerOnline = await isWorkerOnline();
+  if (!id) return reply({ configured: Boolean(process.env.GEMINI_API_KEY && process.env.YOUTUBE_API_KEY), maxDurationSeconds: MAX_VIDEO_SECONDS, workerOnline });
   const job = await getJob(id);
   if (!owner || !job || job.owner !== owner) return reply({ message: "Analysis not found or expired." }, 404);
-  return reply({ id: job.id, mode: job.mode, durationSeconds: job.durationSeconds, ...await getProgress(job) });
+  return reply({ id: job.id, durationSeconds: job.durationSeconds, ...await getProgress(job), workerOnline });
 }
 
 export async function POST(request: NextRequest) {
   if (!sameOrigin(request)) return reply({ message: "Cross-site analysis requests are not allowed." }, 403);
   let input;
   try { input = CreateAnalysisSchema.parse(await smallBody(request)); }
-  catch { return reply({ message: "Supply a valid YouTube video ID and analysis mode." }, 400); }
+  catch { return reply({ message: "Supply a valid YouTube video ID." }, 400); }
   if (!process.env.GEMINI_API_KEY || !process.env.YOUTUBE_API_KEY) return reply({ message: "Add GEMINI_API_KEY and YOUTUBE_API_KEY to .env.local, then start the analysis worker." }, 503);
   const newToken = randomBytes(32).toString("hex");
   const owner = ownerOf(request) ?? createHash("sha256").update(newToken).digest("hex");
@@ -56,11 +57,23 @@ export async function POST(request: NextRequest) {
   try { await mkdir(creationLock); }
   catch { return reply({ message: "Another analysis is being queued. Try again shortly." }, 429); }
   try {
-    const jobs = (await listJobs()).filter((job) => Date.now() - Date.parse(job.createdAt) < JOB_TTL_MS);
+    const jobs = await listJobs();
     const owned = jobs.filter((job) => job.owner === owner);
-    for (const existing of owned.filter((job) => job.videoId === input.videoId && job.mode === input.mode)) {
+    const sameVideo = owned.filter((job) => job.videoId === input.videoId).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    for (const existing of sameVideo) {
       const state = await getProgress(existing);
-      if (["queued", "running", "complete"].includes(state.status)) return reply({ id: existing.id });
+      if (state.status === "queued" || state.status === "running") return reply({ id: existing.id });
+      const partial = state.failedWindows.length > 0;
+      if (state.status === "complete" && !partial) return reply({ id: existing.id });
+      if (partial && (state.status === "complete" || state.status === "failed")) {
+        if (!input.retryFailed) return reply({ id: existing.id });
+        if (state.retryRounds < MAX_RETRY_ROUNDS) {
+          await requestRetry(existing.id);
+          return reply({ id: existing.id }, 202);
+        }
+        if (state.status === "complete") return reply({ message: "Missed sections were already retried. Start a fresh analysis after this one expires." }, 409);
+      }
+      // Cancelled or fully failed analyses fall through to a fresh job.
     }
     if (owned.length >= 6 || jobs.length >= 20) return reply({ message: "The daily analysis limit has been reached. Try again after older jobs expire." }, 429);
     const states = await Promise.all(owned.map(getProgress));
@@ -68,7 +81,7 @@ export async function POST(request: NextRequest) {
     const video = await getYoutubeVideo(input.videoId);
     if (!video || !video.capabilities.canAnalyze || !video.durationSeconds) return reply({ message: "This public video is unavailable for analysis. Live or inaccessible sources cannot be analyzed." }, 422);
     if (video.durationSeconds > MAX_VIDEO_SECONDS) return reply({ message: "This release supports entire videos up to two hours. Longer-video analysis is not yet available." }, 422);
-    const job = await createJob(owner, input.videoId, input.mode, video.durationSeconds);
+    const job = await createJob(owner, input.videoId, video.durationSeconds, clampWindowSeconds(process.env.ANALYSIS_WINDOW_SECONDS));
     const response = reply({ id: job.id }, 202);
     if (!ownerOf(request)) response.cookies.set(COOKIE, newToken, { httpOnly: true, sameSite: "strict", secure: new URL(request.url).protocol === "https:", maxAge: 30 * 86400, path: "/" });
     return response;

@@ -1,74 +1,200 @@
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { analysisRoot, cleanupJobs, getProgress, isCancelled, listJobs, writeProgress } from "../lib/analysis/store.ts";
-import { analysisWindows, mergeSegments } from "../lib/analysis/schema.ts";
-import { analyzeWindow } from "../lib/analysis/gemini.ts";
+import {
+  analysisRoot, cleanupJobs, clearRetryRequest, getProgress, isCancelled, listJobs, retryRequested, workerLock, writeHeartbeat, writeProgress,
+} from "../lib/analysis/store.ts";
+import { AnalysisError, MAX_RETRY_ROUNDS, analysisWindows, highlightLabels, mergeHighlights, mergeTopics, pickProfile } from "../lib/analysis/schema.ts";
+import type { AnalysisJob, AnalysisProgress, AnalysisWindow } from "../lib/analysis/schema.ts";
+import { analyzeWindow, configuredModels } from "../lib/analysis/gemini.ts";
 
-// A single local worker owns progress writes. Requests only create jobs/cancel flags.
-const lock = join(analysisRoot, "worker.lock");
+// A single local worker owns progress writes. Requests only create jobs and cancel/retry flags.
+const CONCURRENCY = Math.min(4, Math.max(1, Math.floor(Number(process.env.ANALYSIS_CONCURRENCY)) || 2));
+const MAX_ATTEMPTS = 3;
 let stopping = false;
-let active: AbortController | null = null;
-for (const event of ["SIGINT", "SIGTERM"] as const) process.on(event, () => { stopping = true; active?.abort(); });
+const controllers = new Set<AbortController>();
+for (const event of ["SIGINT", "SIGTERM"] as const) {
+  process.on(event, () => {
+    stopping = true;
+    for (const controller of controllers) controller.abort();
+  });
+}
+
+const now = () => new Date().toISOString();
+
+function delay(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 async function acquireLock() {
   await mkdir(analysisRoot, { recursive: true });
-  try { await mkdir(lock); }
-  catch (error) {
+  try {
+    await mkdir(workerLock);
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const pid = Number(await readFile(join(lock, "pid"), "utf8").catch(() => ""));
+    const pid = Number(await readFile(join(workerLock, "pid"), "utf8").catch(() => ""));
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Worker lock is incomplete. Check no worker is running before removing .data/analysis/worker.lock.");
     let live = true;
-    try { process.kill(pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") live = false; }
+    try { process.kill(pid, 0); } catch (killError) { if ((killError as NodeJS.ErrnoException).code === "ESRCH") live = false; }
     if (live) throw new Error("An analysis worker is already running.");
-    await rm(lock, { recursive: true, force: true });
-    await mkdir(lock);
+    await rm(workerLock, { recursive: true, force: true });
+    await mkdir(workerLock);
   }
-  await writeFile(join(lock, "pid"), String(process.pid));
+  await writeFile(join(workerLock, "pid"), String(process.pid));
+}
+
+async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: string[]) {
+  const windows = analysisWindows(job.durationSeconds, job.windowSeconds);
+  const controller = new AbortController();
+  controllers.add(controller);
+  const cancelPoll = setInterval(() => {
+    void isCancelled(job.id).then((cancelled) => { if (cancelled) controller.abort(); }).catch(() => undefined);
+  }, 1000);
+
+  // Sections finish concurrently, so progress updates are applied in memory and written in order.
+  let progress: AnalysisProgress = { ...initial, status: "running", message: undefined, updatedAt: now() };
+  let writes = Promise.resolve();
+  const save = (update: (current: AnalysisProgress) => AnalysisProgress) => {
+    progress = update(progress);
+    const snapshot = progress;
+    writes = writes.then(() => writeProgress(job.id, snapshot));
+    return writes;
+  };
+  await save((current) => current);
+
+  let modelIndex = 0;
+  let lastError: string | null = null;
+  let quotaExhausted = false;
+
+  async function analyze(window: AnalysisWindow) {
+    for (let attempt = 1; ; attempt++) {
+      const model = models[modelIndex];
+      try {
+        return await analyzeWindow(job, window, {
+          model,
+          signal: controller.signal,
+          context: { profile: progress.profile, labels: highlightLabels(progress.highlights).map((entry) => entry.label) },
+        });
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+        if (error instanceof AnalysisError && error.quotaExhausted) {
+          if (models[modelIndex] === model && modelIndex < models.length - 1) modelIndex++;
+          if (models[modelIndex] !== model) {
+            console.warn(`Daily quota used up for ${model}; continuing with ${models[modelIndex]}.`);
+            attempt--;
+            continue;
+          }
+          quotaExhausted = true;
+        }
+        if (!(error instanceof AnalysisError) || !error.retryable || attempt >= MAX_ATTEMPTS) throw error;
+        const wait = Math.min(90_000, (error.retryAfterMs ?? 5000 * 3 ** (attempt - 1)) + Math.random() * 1000);
+        console.warn(`Job ${job.id}: section ${window.index + 1} attempt ${attempt} failed (${error.message}); retrying in ${Math.round(wait / 1000)}s.`);
+        await delay(wait, controller.signal);
+      }
+    }
+  }
+
+  async function runSection(window: AnalysisWindow) {
+    if (controller.signal.aborted || stopping) return;
+    try {
+      if (quotaExhausted) throw new AnalysisError(lastError ?? "Gemini's daily quota is used up.", { quotaExhausted: true });
+      const result = await analyze(window);
+      if (controller.signal.aborted) return;
+      const seconds = window.end - window.start;
+      await save((current) => {
+        const windowProfiles = [...current.windowProfiles.filter((entry) => entry.window !== window.index), { window: window.index, seconds, profile: result.profile }];
+        return {
+          ...current,
+          completedWindows: [...current.completedWindows, window.index].sort((a, b) => a - b),
+          failedWindows: current.failedWindows.filter((index) => index !== window.index),
+          coveredSeconds: current.coveredSeconds + seconds,
+          windowProfiles,
+          profile: pickProfile(windowProfiles),
+          highlights: mergeHighlights(current.highlights, result.highlights),
+          topics: mergeTopics(current.topics, result.topics),
+          rejectedSuggestions: current.rejectedSuggestions + result.rejected,
+          updatedAt: now(),
+        };
+      });
+      console.log(`Job ${job.id}: section ${window.index + 1}/${windows.length} done (${result.highlights.length} highlights, ${result.topics.length} topics, ${result.rejected} rejected).`);
+    } catch (error) {
+      if (controller.signal.aborted || stopping) return;
+      lastError = error instanceof AnalysisError ? error.message : "Unexpected analysis error.";
+      if (!(error instanceof AnalysisError)) console.error(error);
+      await save((current) => ({ ...current, failedWindows: [...new Set([...current.failedWindows, window.index])], updatedAt: now() }));
+      console.error(`Job ${job.id}: section ${window.index + 1} failed: ${lastError}`);
+    }
+  }
+
+  const pending = windows.filter((window) => !progress.completedWindows.includes(window.index) && !progress.failedWindows.includes(window.index));
+  console.log(`Analyzing job ${job.id}: ${pending.length} of ${windows.length} section(s), up to ${CONCURRENCY} at a time.`);
+  // With nothing analyzed yet, run one section first so later sections share its content type and labels.
+  if (progress.completedWindows.length === 0 && pending.length > 1) await runSection(pending.shift()!);
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, async () => {
+    for (let window = pending.shift(); window; window = pending.shift()) await runSection(window);
+  }));
+
+  clearInterval(cancelPoll);
+  controllers.delete(controller);
+  await writes;
+  if (stopping) return;
+  if (await isCancelled(job.id)) {
+    await save((current) => ({ ...current, status: "cancelled", updatedAt: now() }));
+    return;
+  }
+  await save((current) => {
+    const done = current.completedWindows.length;
+    if (done === current.totalWindows) return { ...current, status: "complete", message: undefined, updatedAt: now() };
+    const missed = current.totalWindows - done;
+    return {
+      ...current,
+      status: done > 0 ? "complete" : "failed",
+      message: done > 0 ? `${missed} of ${current.totalWindows} sections could not be analyzed. ${lastError ?? ""}`.trim() : lastError ?? "Analysis failed.",
+      updatedAt: now(),
+    };
+  });
+  console.log(`Job ${job.id} finished: ${progress.status}.`);
 }
 
 async function main() {
   if (!process.env.GEMINI_API_KEY) throw new Error("Set GEMINI_API_KEY in .env.local before starting the analysis worker.");
+  const models = configuredModels();
   await acquireLock();
-  console.log("Video analysis worker ready. Waiting for jobs.");
+  await writeHeartbeat();
+  const heartbeat = setInterval(() => void writeHeartbeat().catch(() => undefined), 5000);
+  console.log(`Video analysis worker ready (${models.join(" -> ")}). Waiting for jobs.`);
+  let lastCleanup = 0;
   try {
     while (!stopping) {
-      await cleanupJobs();
+      if (Date.now() - lastCleanup > 60_000) {
+        await cleanupJobs();
+        lastCleanup = Date.now();
+      }
       const jobs = (await listJobs()).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
       for (const job of jobs) {
         if (stopping) break;
         let progress = await getProgress(job);
-        if (!["queued", "running"].includes(progress.status)) continue;
-        const windows = analysisWindows(job.durationSeconds, job.mode);
-        progress = { ...progress, status: "running", message: undefined, updatedAt: new Date().toISOString() };
-        await writeProgress(job.id, progress);
-        console.log(`Analyzing job ${job.id} (${job.mode}).`);
-        for (let index = progress.completedWindows; index < windows.length && !stopping; index++) {
-          active = new AbortController();
-          const controller = active;
-          const cancellation = setInterval(() => {
-            void isCancelled(job.id).then((cancelled) => { if (cancelled) controller.abort(); }).catch(() => controller.abort());
-          }, 1000);
-          try {
-            if (await isCancelled(job.id)) break;
-            const segments = await analyzeWindow(job, windows[index], controller.signal);
-            if (await isCancelled(job.id)) break;
-            progress = { ...progress, completedWindows: index + 1, coveredSeconds: windows[index].end,
-              segments: mergeSegments(progress.segments, segments),
-              status: index === windows.length - 1 ? "complete" : "running", updatedAt: new Date().toISOString() };
-            await writeProgress(job.id, progress);
-          } catch (error) {
-            if (stopping || await isCancelled(job.id)) break;
-            progress = { ...progress, status: "failed", updatedAt: new Date().toISOString(),
-              message: error instanceof Error && !error.name.startsWith("Zod")
-                ? error.message.slice(0, 220) : "The model returned an invalid analysis. Completed windows have been preserved." };
-            await writeProgress(job.id, progress);
-            console.error(`Job ${job.id} failed; completed windows preserved.`);
-            break;
-          } finally { clearInterval(cancellation); active = null; }
+        if ((progress.status === "complete" || progress.status === "failed") && progress.failedWindows.length > 0 && await retryRequested(job.id)) {
+          await clearRetryRequest(job.id);
+          if (progress.retryRounds < MAX_RETRY_ROUNDS) {
+            progress = { ...progress, status: "queued", failedWindows: [], retryRounds: progress.retryRounds + 1, message: undefined };
+          }
         }
+        if (progress.status === "queued" || progress.status === "running") await processJob(job, progress, models);
       }
-      if (!stopping) await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (!stopping) await new Promise((resolve) => setTimeout(resolve, 1500));
     }
-  } finally { await rm(lock, { recursive: true, force: true }); }
+  } finally {
+    clearInterval(heartbeat);
+    await rm(workerLock, { recursive: true, force: true });
+  }
 }
-main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exitCode = 1;
+});

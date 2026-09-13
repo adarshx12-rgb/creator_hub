@@ -4,11 +4,12 @@
   "version": "0.1.0",
   "scripts": {
     "dev": "next dev",
+    "dev:all": "node scripts/dev.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "analysis:worker": "node --env-file=.env.local --experimental-strip-types scripts/analysis-worker.ts",
+    "analysis:worker": "node --env-file-if-exists=.env.local --experimental-strip-types scripts/analysis-worker.ts",
     "test:analysis": "node --experimental-strip-types --test tests/analysis.test.ts"
   },
   "dependencies": {
