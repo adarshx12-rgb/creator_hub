@@ -128,6 +128,7 @@ export function MomentsPanel({ video, canCaptureTime, getCurrentTime, seekTo }: 
                       className="flex items-center gap-1 rounded bg-accent-soft px-1.5 py-0.5 font-mono text-[0.7rem] text-accent-strong disabled:cursor-default"
                     >
                       <Play size={10} /> {formatTimecode(moment.startSeconds)}
+                      {moment.endSeconds !== null && `–${formatTimecode(moment.endSeconds)}`}
                     </button>
                   ) : (
                     <span className="rounded bg-surface-hover px-1.5 py-0.5 text-[0.7rem] text-text-faint">

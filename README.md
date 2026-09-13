@@ -19,6 +19,8 @@ complete trim/crop editing UI. Auth, cloud persistence, and the FFmpeg export wo
 - Twitch Helix API (optional) for channel discovery, past broadcasts, highlights, uploads, and
   official clips, with Twitch's own video and clip players
 - Anthropic API (optional) for LLM-based query understanding, with a regex heuristic fallback
+- Gemini API (optional) for grounded public-YouTube video analysis: spoken topic chapters and
+  gameplay events such as kills, round wins, aces, and clutches
 - Browser `localStorage` for saved moments, recent searches, uploads, and export jobs (see
   limitations below)
 - A Supabase schema migration for the future auth/projects/transcripts phase (not yet applied to a
@@ -26,7 +28,8 @@ complete trim/crop editing UI. Auth, cloud persistence, and the FFmpeg export wo
 
 ## Local setup
 
-Requires Node 20+.
+Requires Node 20+ for the website. The analysis worker uses Node 24+ because it runs TypeScript
+directly with Node's native type stripping.
 
 ```bash
 npm install
@@ -42,6 +45,8 @@ Open http://localhost:3000.
 |---|---|---|
 | `YOUTUBE_API_KEY` | Real search results and video detail pages | The app runs and shows an honest "search isn't configured yet" state instead of results |
 | `ANTHROPIC_API_KEY` | Smarter query parsing (subject/topic/duration extraction) | Falls back to a regex heuristic parser — search still works |
+| `GEMINI_API_KEY` | Whole-video AI analysis for public YouTube sources | The analysis action stays disabled when missing |
+| `GEMINI_VIDEO_MODEL` | Optional Gemini model override | Uses `gemini-3.8-flash` |
 | `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` | Twitch as a second discovery source | Twitch results are simply omitted with a "Twitch isn't configured yet" notice; YouTube keeps working |
 | `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY` | Not used yet | No effect — reserved for the auth/projects phase |
 
@@ -99,7 +104,32 @@ npm run build       # production build
 npm run start        # run the production build
 npm run lint          # eslint
 npm run typecheck  # tsc --noEmit
+npm run analysis:worker # process queued Gemini video analysis jobs
+npm run test:analysis # mocked analysis/API contract tests
 ```
+
+### Analyze a whole YouTube video
+
+On a public YouTube video detail page, **Find moments with AI** scans the full video in **Spoken
+topics** or **Gameplay events** mode. Topic mode returns timestamped chapters and paraphrased
+summaries. Gameplay mode looks for visible kill-feed/HUD evidence for kills, round results for wins,
+and an ACE banner or five attributable kills for an ace. Each result includes evidence, confidence,
+and an editable range that can be saved to Collections.
+
+Configure `GEMINI_API_KEY` and `YOUTUBE_API_KEY`, then run `npm run analysis:worker` in a second
+terminal. The asynchronous worker writes owner-scoped jobs under `.data/analysis` (or
+`ANALYSIS_DATA_DIR`), retains them for 24 hours, resumes completed windows after restart, preserves
+partial results, and supports cancellation. It does not download a YouTube stream. Analysis is
+limited to public YouTube videos up to two hours in this first slice.
+
+Gemini receives the public YouTube URL and analyzes audio plus sampled frames. Long videos are split
+into context windows with overlap; gameplay uses higher frame sampling because fast events are easier
+to miss. Structured JSON is checked against the source duration and evidence timestamps before it
+reaches the browser. AI suggestions are not proof and do not grant reuse rights.
+
+“Most replayed” is shown as unavailable for arbitrary videos. YouTube retention data requires
+authorized channel-owner Analytics API access; the public Data API does not expose a replay heatmap.
+The product does not turn AI confidence or view count into a fake replay statistic.
 
 ## What's implemented
 
@@ -144,8 +174,8 @@ flow + full trim/crop UI. Not implemented yet:
   client-side, but nothing renders an actual MP4 — there's no durable job queue, no worker process,
   and this environment doesn't even have `ffmpeg`/`ffprobe` installed. Export jobs are saved with a
   clear "blocked, worker not connected" status rather than a fabricated success or progress bar.
-- **Transcript-based AI moments and topic chips.** These require authorized access to a video's
-  audio/transcript, which this build doesn't have for source-only YouTube discovery results.
+- **Twitch AI analysis and arbitrary remote video files.** The first AI slice supports public YouTube
+  URLs through Gemini. Twitch playback works, but Twitch analysis needs an authorized upload path.
 - **Wider-web search beyond YouTube/Twitch**, and Kick specifically. Kick has no official public API
   for search, VODs, or clips today — only livestream/channel/chat/category/event endpoints — so
   there's no compliant way to add it yet. The source filter shows it as "coming soon" rather than
@@ -179,6 +209,17 @@ flow + full trim/crop UI. Not implemented yet:
   rate limits, partial failures, and missing/expired videos.
 - Live Twitch search and playback were not verified because credentials were not configured.
   The earlier browser checks below predate this Twitch update.
+
+### AI analysis update — 2026-09-14
+
+- TypeScript and ESLint passed.
+- All eight analysis tests in `tests/analysis.test.ts` passed with mocked Gemini responses. They
+  cover window coverage, strict input validation, timestamp/evidence bounds, gameplay evidence
+  rules, boundary deduplication, structured requests, restart recovery, cancellation, CSRF checks,
+  owner isolation, idempotency, and source eligibility.
+- Live Gemini analysis was not run because `GEMINI_API_KEY` was not configured. Real detection quality
+  still needs representative public interviews and gameplay videos; the tests verify contracts and
+  safety behavior rather than model accuracy.
 
 ### Earlier project verification
 

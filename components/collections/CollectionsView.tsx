@@ -86,6 +86,7 @@ export function CollectionsView() {
                               className="flex shrink-0 items-center gap-1 rounded bg-accent-soft px-1.5 py-0.5 font-mono text-accent-strong"
                             >
                               <Play size={10} /> {formatTimecode(moment.startSeconds)}
+                              {moment.endSeconds !== null && `–${formatTimecode(moment.endSeconds)}`}
                             </Link>
                           ) : (
                             <span className="shrink-0 rounded bg-surface-hover px-1.5 py-0.5 text-text-faint">

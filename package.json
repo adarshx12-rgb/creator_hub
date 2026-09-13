@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "analysis:worker": "node --env-file=.env.local --experimental-strip-types scripts/analysis-worker.ts",
+    "test:analysis": "node --experimental-strip-types --test tests/analysis.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",

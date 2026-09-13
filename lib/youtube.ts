@@ -38,9 +38,9 @@ function capabilitiesFor(embeddable: boolean | undefined, privacyStatus: string 
   }
   return {
     canPreview: true,
-    canAnalyze: false,
+    canAnalyze: Boolean(process.env.GEMINI_API_KEY),
     canExport: false,
-    capabilityReason: "Official playback only. Export requires an authorized upload of this footage.",
+    capabilityReason: "Official playback. AI analysis uses Gemini's public YouTube video input when configured; export requires an authorized upload.",
     evidenceType: "metadata",
   };
 }
