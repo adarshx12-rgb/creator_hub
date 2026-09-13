@@ -29,7 +29,7 @@ export function SearchConsole() {
 
   return (
     <div className="flex min-h-[calc(100dvh-4rem)] items-center justify-center px-6 py-16 md:min-h-dvh">
-      <RevealGroup className="w-full max-w-2xl">
+      <RevealGroup className="min-w-0 w-full max-w-2xl">
         <MomentGraphic />
         <RevealItem className="mb-3 text-center">
           <h1 className="font-display text-3xl font-medium tracking-tight text-text sm:text-4xl">
@@ -44,6 +44,7 @@ export function SearchConsole() {
         </RevealItem>
         <RevealItem>
           <SearchBar onSubmit={runSearch} />
+          <p className="mt-3 text-center text-xs text-text-muted">Search a Twitch channel name, or paste a Twitch video or clip link.</p>
         </RevealItem>
         <RevealItem className="mt-4 flex flex-wrap justify-center gap-2">
           {EXAMPLE_QUERIES.map((example) => (

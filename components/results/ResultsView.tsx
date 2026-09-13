@@ -134,13 +134,16 @@ export function ResultsView() {
                 ? `${PROVIDER_LABEL[n.provider]} isn't configured yet`
                 : n.status === "quota_exceeded"
                   ? `${PROVIDER_LABEL[n.provider]} quota reached`
-                  : `${PROVIDER_LABEL[n.provider]} search failed`,
+                  : n.message ?? `${PROVIDER_LABEL[n.provider]} search failed`,
             )
             .join(" · ")}
         </p>
       )}
 
       {loading && <ResultsSkeleton />}
+      {!loading && data?.results.some((result) => result.provider === "twitch") && (
+        <p className="mb-4 text-xs text-text-muted">Twitch matches channel names and shows a selection of their videos and clips. Further pages show YouTube results.</p>
+      )}
 
       {!loading && data?.status === "setup_required" && <SetupRequiredPanel message={data.message} />}
       {!loading && data?.status === "quota_exceeded" && <QuotaExceededPanel message={data.message} />}
@@ -154,7 +157,7 @@ export function ResultsView() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <AnimatePresence>
               {filteredResults.map((result) => (
-                <ResultCard key={result.id} result={result} />
+                <ResultCard key={`${result.provider}:${result.id}`} result={result} />
               ))}
             </AnimatePresence>
           </div>

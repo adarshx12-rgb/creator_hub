@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/Button";
 import { formatTimecode } from "@/lib/format";
 import { addSavedMoment, getSavedMoments, removeSavedMoment, updateSavedMoment } from "@/lib/local-store";
 import type { SavedMoment, SearchResult } from "@/lib/types";
+import { parseTwitchLink } from "@/lib/twitch-links";
 
 interface MomentsPanelProps {
   video: SearchResult;
@@ -50,9 +51,8 @@ export function MomentsPanel({ video, canCaptureTime, getCurrentTime, seekTo }: 
         endSeconds: null,
         note: "",
         createdAt: new Date().toISOString(),
-        // A Twitch search result is already an official Clip someone created, so bookmarking
-        // it as-is is the same thing as pasting a Clip link on YouTube.
-        linkType: video.provider === "twitch" && startSeconds === null ? "official_clip" : "timestamp",
+        // Keep whole-video bookmarks distinct from official clips.
+        linkType: video.provider === "twitch" && video.mediaType === "clip" ? "official_clip" : "timestamp",
         savedLink,
       }),
     );
@@ -60,8 +60,11 @@ export function MomentsPanel({ video, canCaptureTime, getCurrentTime, seekTo }: 
 
   function saveClipLink() {
     const trimmed = clipUrl.trim();
-    if (!/^https:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(trimmed) && !/^https:\/\/clips\.twitch\.tv\//i.test(trimmed)) {
-      setClipError("Paste a youtube.com, youtu.be, or clips.twitch.tv link.");
+    const validClip = video.provider === "twitch"
+      ? parseTwitchLink(trimmed)?.kind === "clip"
+      : /^https:\/\/(www\.)?youtube\.com\/clip\/[\w-]+(?:[?#].*)?$/i.test(trimmed);
+    if (!validClip) {
+      setClipError(video.provider === "twitch" ? "Paste a clips.twitch.tv or twitch.tv/channel/clip link." : "Paste an official youtube.com/clip link.");
       return;
     }
     refresh(
@@ -96,8 +99,9 @@ export function MomentsPanel({ video, canCaptureTime, getCurrentTime, seekTo }: 
 
       {moments.length === 0 ? (
         <p className="mt-3 text-xs leading-relaxed text-text-faint">
-          No moments saved yet. Save a timestamp while watching, or paste a link from YouTube&apos;s own
-          Clip feature below.
+          {video.provider === "twitch"
+            ? "Save this Twitch source or paste an official Twitch clip below. Player timestamp capture is currently available for YouTube."
+            : "Save a timestamp while watching, or paste a link from YouTube's Clip feature below."}
         </p>
       ) : (
         <ul className="mt-3 space-y-2">
@@ -164,7 +168,7 @@ export function MomentsPanel({ video, canCaptureTime, getCurrentTime, seekTo }: 
       )}
 
       <div className="mt-4 border-t border-border pt-3">
-        <p className="mb-1.5 text-xs text-text-faint">Have an official YouTube or Twitch Clip link? Save it here.</p>
+        <p className="mb-1.5 text-xs text-text-faint">Have an official {video.provider === "twitch" ? "Twitch" : "YouTube"} clip link? Save it here.</p>
         <div className="flex gap-2">
           <input
             value={clipUrl}
@@ -172,7 +176,8 @@ export function MomentsPanel({ video, canCaptureTime, getCurrentTime, seekTo }: 
               setClipUrl(e.target.value);
               setClipError(null);
             }}
-            placeholder="https://youtube.com/clip/..."
+            aria-label="Official clip URL"
+            placeholder={video.provider === "twitch" ? "https://clips.twitch.tv/..." : "https://youtube.com/clip/..."}
             className="min-w-0 flex-1 rounded-md border border-border-strong bg-surface-raised px-2.5 py-1.5 text-xs text-text placeholder:text-text-faint focus:border-accent/60 focus:outline-none"
           />
           <Button variant="secondary" size="sm" onClick={saveClipLink} disabled={!clipUrl.trim()}>

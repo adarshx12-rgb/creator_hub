@@ -5,15 +5,17 @@ import { ExternalLink, ShieldOff } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import type { SearchResult } from "@/lib/types";
 import type { RefObject } from "react";
+import { TwitchPlayer } from "./TwitchPlayer";
 
 interface PlayerPanelProps {
   video: SearchResult;
   containerRef: RefObject<HTMLDivElement | null>;
+  initialSeconds?: number;
 }
 
 const PLATFORM_LABEL: Record<SearchResult["provider"], string> = { youtube: "YouTube", twitch: "Twitch" };
 
-export function PlayerPanel({ video, containerRef }: PlayerPanelProps) {
+export function PlayerPanel({ video, containerRef, initialSeconds }: PlayerPanelProps) {
   if (!video.capabilities.canPreview) {
     return (
       <div className="relative aspect-video w-full overflow-hidden rounded-lg border border-border bg-surface">
@@ -32,17 +34,7 @@ export function PlayerPanel({ video, containerRef }: PlayerPanelProps) {
   }
 
   if (video.provider === "twitch") {
-    const parent = typeof window !== "undefined" ? window.location.hostname : "localhost";
-    return (
-      <div className="aspect-video w-full overflow-hidden rounded-lg border border-border bg-black">
-        <iframe
-          src={`https://clips.twitch.tv/embed?clip=${encodeURIComponent(video.id)}&parent=${parent}&autoplay=false`}
-          className="h-full w-full"
-          allowFullScreen
-          title={video.title}
-        />
-      </div>
-    );
+    return <TwitchPlayer video={video} initialSeconds={initialSeconds} />;
   }
 
   return (

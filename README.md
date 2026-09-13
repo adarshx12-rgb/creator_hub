@@ -16,8 +16,8 @@ complete trim/crop editing UI. Auth, cloud persistence, and the FFmpeg export wo
 - [`motion`](https://motion.dev) for the interface's animation (hero reveal, route transitions,
   trim-handle and crop-drag interactions)
 - YouTube Data API v3 for real search, metadata, and embedded playback
-- Twitch Helix API (optional) as a second discovery source — channel search plus that channel's
-  official Clips, embedded via Twitch's own clip player
+- Twitch Helix API (optional) for channel discovery, past broadcasts, highlights, uploads, and
+  official clips, with Twitch's own video and clip players
 - Anthropic API (optional) for LLM-based query understanding, with a regex heuristic fallback
 - Browser `localStorage` for saved moments, recent searches, uploads, and export jobs (see
   limitations below)
@@ -51,12 +51,46 @@ Get a YouTube key from the [Google Cloud Console](https://console.cloud.google.c
 
 Get a free Twitch client ID/secret from the [Twitch Developer Console](https://dev.twitch.tv/console/apps).
 Twitch has no full-text "search by topic" API — only channel-name search — so Twitch results only
-appear when the parsed query names something close to a real channel/person; it then lists that
-channel's existing official Clips (a Clip is a moment someone already created and shared, which is
-exactly the "point to the source's own re-use path" pattern used for YouTube). **Kick is not
+appear when the query names a channel/person; it then lists a bounded selection of that channel's
+videos and official clips. Pasting a Twitch channel, video, or clip URL also works. **Kick is not
 integrated**: Kick currently has no official public API for search, VODs, or clips, so there is
 nothing to wire up without resorting to scraping or an unofficial third-party API, which this
 project does not do.
+
+### Enable Twitch
+
+**Integration status (2026-09-14):** Implemented in the local project. Channel discovery returns
+videos and official clips; direct Twitch URL lookup, embedded playback, source bookmarks,
+thumbnail support, token refresh, and API error handling are wired up. The homepage also includes
+an animated video research and clipping example with replay and reduced-motion support.
+
+**Activation pending:** `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` were not configured when
+checked. Add both values using the steps below, restart the server, and verify a real channel
+search, video playback, clip playback, and saved-source reopening in the browser.
+
+1. Register an application in the [Twitch Developer Console](https://dev.twitch.tv/console/apps).
+2. Set `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env.local` (or your host's server environment).
+   Keep the secret server-side; do not use a `NEXT_PUBLIC_` variable. This integration uses an app
+   access token, so visitors do not need to log in to Twitch.
+3. Restart the development server, then search a channel's login or paste
+   `https://www.twitch.tv/videos/VIDEO_ID`, `https://clips.twitch.tv/CLIP_SLUG`, or
+   `https://www.twitch.tv/CHANNEL/clip/CLIP_SLUG` with real IDs.
+
+The player derives Twitch's `parent` parameter from the current hostname after mounting. Use HTTPS
+in production. Below Twitch's minimum embed width of 400px, an external watch link replaces the
+player. Deleted, expired, or restricted videos may not play; the Twitch link remains available.
+See the [official embed requirements](https://dev.twitch.tv/docs/embed/video-and-clips/).
+
+Twitch results are a bounded discovery batch on the first results page (up to 20 items from up to
+three channels); subsequent pages currently paginate YouTube only. Helix supports cursors, but
+separate Twitch pagination is not implemented. Clip ordering sorts the fetched sample, not the
+channel's entire clip history. Twitch bookmarks save the source or official clip; automatic
+player timestamp capture remains YouTube-only. Downloads and live streams are not included.
+
+Run `node --test tests/twitch.test.cjs` for mocked Twitch contract tests. These check URL parsing,
+embed parameters, metadata normalization, token refresh, missing credentials, rate limits, and
+partial failures without calling Twitch. Live search/playback still needs configured credentials
+and a browser check.
 
 ### Other scripts
 
@@ -74,15 +108,15 @@ npm run typecheck  # tsc --noEmit
    `prefers-reduced-motion`.
 2. **Results** — real YouTube and (optionally) Twitch search merged into one grid (via
    `/api/search`), each card labeled with its platform, with sort (relevance/newest/most viewed),
-   client-side duration and source filtering, cursor-based pagination (YouTube only — Twitch has no
-   page-token pagination of its own, so its clips are folded into page one), and honest
+   client-side duration and source filtering, cursor-based pagination (YouTube only — Twitch's
+   bounded video/clip batch is folded into page one), and honest
    empty/error/quota/setup-required/partial-provider-failure states. Query parsing tries the
    Anthropic API first (extracting subject, topic, visual requirements, and a target duration
    range), and falls back to a regex heuristic if no key is configured or the call fails.
 3. **Video detail** (`/video/[provider]/[id]`) — official embedded playback for both platforms (or
    an honest "embedding disabled"/"not configured" state), source attribution with copy-link, and a
    moments panel: **Save current timestamp** captures the real YouTube player position and stores a
-   `?t=`-timestamped link (Twitch clip playback is a plain iframe embed with no JS control API wired
+   `?t=`-timestamped link (Twitch playback is a plain iframe embed with no JS control API wired
    up yet, so Twitch bookmarks save the source itself); a separate field lets you paste in an
    official YouTube or Twitch Clip link rather than fabricating one. Topic chips are intentionally
    absent here with an explanation — they'd require transcript access this build doesn't have.
@@ -117,8 +151,8 @@ flow + full trim/crop UI. Not implemented yet:
   there's no compliant way to add it yet. The source filter shows it as "coming soon" rather than
   pretending it works.
 - **Twitch topic search.** Twitch's official API has no full-text "search clips/VODs by content"
-  endpoint, only channel-name search, so a Twitch result only ever means "this channel's existing
-  Clips," not "a clip anywhere on Twitch about this topic." This is a platform capability gap, not a
+  endpoint, only channel-name search, so a Twitch result means "this channel's videos and
+  clips," not "a clip anywhere on Twitch about this topic." This is a platform capability gap, not a
   bug.
 - **Visual scene indexing and first-party replay analytics** — explicitly later-phase per the
   product plan.
@@ -136,6 +170,17 @@ flow + full trim/crop UI. Not implemented yet:
   quotas can change.
 
 ## Verification performed
+
+### Twitch integration update — 2026-09-14
+
+- Production build, TypeScript check, and ESLint passed.
+- All eight tests in `tests/twitch.test.cjs` passed using mocked API responses, including URL
+  validation, embed parameters, metadata mapping, token reuse/refresh, missing credentials,
+  rate limits, partial failures, and missing/expired videos.
+- Live Twitch search and playback were not verified because credentials were not configured.
+  The earlier browser checks below predate this Twitch update.
+
+### Earlier project verification
 
 - `npm run build`, `npm run typecheck`, and `npm run lint` all pass clean.
 - Manually drove all five routes (`/`, `/results`, `/collections`, `/studio`, `/exports`) plus a

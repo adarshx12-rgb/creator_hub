@@ -12,6 +12,7 @@ export interface Capabilities {
 
 export interface SearchResult {
   id: string;
+  mediaType?: "video" | "clip";
   provider: Provider;
   url: string;
   title: string;

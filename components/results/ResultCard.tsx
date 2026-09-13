@@ -43,6 +43,7 @@ export function ResultCard({ result }: { result: SearchResult }) {
             className={`absolute left-1.5 top-1.5 rounded px-1.5 py-0.5 text-[0.65rem] font-medium ${PLATFORM_CLASS[result.provider]}`}
           >
             {PLATFORM_LABEL[result.provider]}
+            {result.provider === "twitch" && (result.mediaType === "video" ? " video" : " clip")}
           </span>
           <span className="absolute bottom-1.5 right-1.5 rounded bg-black/75 px-1.5 py-0.5 font-mono text-[0.7rem] tabular-nums text-white">
             {formatDuration(result.durationSeconds)}

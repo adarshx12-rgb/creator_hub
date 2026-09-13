@@ -29,7 +29,7 @@ export function VideoDetailView({ video, initialSeconds }: { video: SearchResult
       </Link>
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-4">
-          <PlayerPanel video={video} containerRef={containerRef} />
+          <PlayerPanel video={video} containerRef={containerRef} initialSeconds={initialSeconds} />
           <TopicPanel />
         </div>
         <div className="space-y-4">
