@@ -1,6 +1,6 @@
 import "server-only";
 import { parseIso8601Duration } from "./format";
-import type { Capabilities, ParsedQuery, SearchResponse, SearchResult, SortOrder } from "./types";
+import type { Capabilities, ParsedQuery, PopularVideo, PopularVideos, SearchResponse, SearchResult, SortOrder } from "./types";
 
 const SEARCH_URL = "https://www.googleapis.com/youtube/v3/search";
 const VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos";
@@ -258,4 +258,37 @@ export async function getYoutubeVideo(id: string): Promise<SearchResult | null> 
     matchType: "metadata",
     capabilities: capabilitiesFor(item.status?.embeddable, item.status?.privacyStatus),
   };
+}
+
+/** YouTube's own mostPopular chart, in YouTube's order. Never throws; failures return an honest status. */
+export async function getPopularYoutubeVideos(limit = 8): Promise<PopularVideos> {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) return { status: "setup_required", videos: [], fetchedAt: null };
+
+  const params = new URLSearchParams({ part: "snippet", chart: "mostPopular", maxResults: String(limit), key: apiKey });
+  try {
+    // One quota unit per hour at most; well inside YouTube's 30-day limit for stored API data.
+    const res = await fetch(`${VIDEOS_URL}?${params.toString()}`, { next: { revalidate: 3600 } });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as YoutubeApiError | null;
+      const reason = body?.error?.errors?.[0]?.reason;
+      const quota = reason === "quotaExceeded" || reason === "dailyLimitExceeded";
+      return { status: quota ? "quota_exceeded" : "error", videos: [], fetchedAt: null };
+    }
+
+    const json = (await res.json()) as {
+      items?: { id: string; snippet: { title: string; channelTitle: string; thumbnails: Record<string, { url: string }> } }[];
+    };
+    const videos = (json.items ?? []).flatMap((item): PopularVideo[] => {
+      const { thumbnails } = item.snippet;
+      const thumbnailUrl = thumbnails.maxres?.url || thumbnails.standard?.url || thumbnails.high?.url || thumbnails.medium?.url;
+      if (!thumbnailUrl?.startsWith("https://i.ytimg.com/")) return [];
+      return [{ id: item.id, title: item.snippet.title, channelTitle: item.snippet.channelTitle, thumbnailUrl }];
+    });
+    // The Date header is cached with the response, so it reflects when YouTube actually served the chart.
+    const servedAt = Date.parse(res.headers.get("date") ?? "");
+    return { status: "ok", videos, fetchedAt: Number.isNaN(servedAt) ? null : new Date(servedAt).toISOString() };
+  } catch {
+    return { status: "error", videos: [], fetchedAt: null };
+  }
 }

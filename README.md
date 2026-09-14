@@ -69,8 +69,15 @@ project does not do.
 
 **Integration status (2026-09-14):** Implemented in the local project. Channel discovery returns
 videos and official clips; direct Twitch URL lookup, embedded playback, source bookmarks,
-thumbnail support, token refresh, and API error handling are wired up. The homepage also includes
-an animated video research and clipping example with replay and reduced-motion support.
+thumbnail support, token refresh, and API error handling are wired up.
+
+**Homepage showcase:** a skew-rotating card deck shows YouTube's official `mostPopular` chart
+(`videos.list`, 1 quota unit, cached for an hour) with titles, channels, and a link to each video's
+source page. Without `YOUTUBE_API_KEY`, or if the request fails, it shows clearly labeled example
+topics instead. Beside it, an illustrated clip workflow (marked "Example") shows trimming and 9:16
+reframing. Both support pause/replay and reduced motion: when the device asks for reduced motion,
+cards cross-fade instead of rotating, and a "Turn on animations" button lets the visitor opt back in
+(remembered in `localStorage`).
 
 **Activation pending:** `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` were not configured when
 checked. Add both values using the steps below, restart the server, and verify a real channel

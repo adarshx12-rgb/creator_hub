@@ -58,6 +58,19 @@ export interface SearchResponse {
   providerNotices?: ProviderNotice[];
 }
 
+export interface PopularVideo {
+  id: string;
+  title: string;
+  channelTitle: string;
+  thumbnailUrl: string;
+}
+
+export interface PopularVideos {
+  status: SearchStatus;
+  videos: PopularVideo[];
+  fetchedAt: string | null;
+}
+
 export interface SavedMoment {
   id: string;
   provider: Provider;
