@@ -3,13 +3,19 @@ import { join } from "node:path";
 import {
   analysisRoot, cleanupJobs, clearRetryRequest, getProgress, isCancelled, listJobs, retryRequested, workerLock, writeHeartbeat, writeProgress,
 } from "../lib/analysis/store.ts";
-import { AnalysisError, MAX_RETRY_ROUNDS, analysisWindows, highlightLabels, mergeHighlights, mergeTopics, pickProfile } from "../lib/analysis/schema.ts";
-import type { AnalysisJob, AnalysisProgress, AnalysisWindow } from "../lib/analysis/schema.ts";
-import { analyzeWindow, configuredModels } from "../lib/analysis/gemini.ts";
-import { fetchNativeTranscript, groundHighlights, transcriptForWindow, transcriptPrompt } from "../lib/analysis/transcript.ts";
+import { AnalysisError, MAX_RETRY_ROUNDS, analysisWindows, mergeHighlights, mergeTopics, pickProfile } from "../lib/analysis/schema.ts";
+import type { AnalysisJob, AnalysisProgress, AnalysisRole, AnalysisWindow } from "../lib/analysis/schema.ts";
+import { providerOf, roleModels } from "../lib/analysis/models.ts";
+import type { Provider } from "../lib/analysis/models.ts";
+import { analyzeSection, choosePlan, planAnalysis, planningSample, visualPassMode } from "../lib/analysis/pipeline.ts";
+import type { RoleRunner } from "../lib/analysis/pipeline.ts";
+import { fetchNativeTranscript, transcriptForWindow } from "../lib/analysis/transcript.ts";
 
 // A single local worker owns progress writes. Requests only create jobs and cancel/retry flags.
-const CONCURRENCY = Math.min(4, Math.max(1, Math.floor(Number(process.env.ANALYSIS_CONCURRENCY)) || 2));
+// Sections run in parallel; each provider has its own request limit, so slow footage scans never hold
+// up transcript reading.
+const GEMINI_REQUESTS = Math.min(4, Math.max(1, Math.floor(Number(process.env.ANALYSIS_CONCURRENCY)) || 2));
+const CLAUDE_REQUESTS = 4;
 const MAX_ATTEMPTS = 3;
 let stopping = false;
 const controllers = new Set<AbortController>();
@@ -21,6 +27,7 @@ for (const event of ["SIGINT", "SIGTERM"] as const) {
 }
 
 const now = () => new Date().toISOString();
+const elapsed = (ms: number) => `${Math.round(ms / 1000)}s`;
 
 function delay(ms: number, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
@@ -30,6 +37,25 @@ function delay(ms: number, signal: AbortSignal) {
     signal.addEventListener("abort", onAbort, { once: true });
   });
 }
+
+type Limit = <T>(task: () => Promise<T>) => Promise<T>;
+
+function limiter(size: number): Limit {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  return async (task) => {
+    while (active >= size) await new Promise<void>((resolve) => waiting.push(resolve));
+    active++;
+    try {
+      return await task();
+    } finally {
+      active--;
+      waiting.shift()?.();
+    }
+  };
+}
+
+const limits: Record<Provider, Limit> = { gemini: limiter(GEMINI_REQUESTS), claude: limiter(CLAUDE_REQUESTS) };
 
 async function acquireLock() {
   await mkdir(analysisRoot, { recursive: true });
@@ -48,7 +74,7 @@ async function acquireLock() {
   await writeFile(join(workerLock, "pid"), String(process.pid));
 }
 
-async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: string[]) {
+async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: Record<AnalysisRole, string[]>) {
   const windows = analysisWindows(job.durationSeconds, job.windowSeconds);
   const controller = new AbortController();
   controllers.add(controller);
@@ -57,7 +83,7 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
   }, 1000);
 
   // Sections finish concurrently, so progress updates are applied in memory and written in order.
-  let progress: AnalysisProgress = { ...initial, status: "running", message: undefined, updatedAt: now() };
+  let progress: AnalysisProgress = { ...initial, status: "running", message: undefined, startedAt: now(), finishedAt: undefined, updatedAt: now() };
   let writes = Promise.resolve();
   const save = (update: (current: AnalysisProgress) => AnalysisProgress) => {
     progress = update(progress);
@@ -67,9 +93,45 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
   };
   await save((current) => current);
 
-  let modelIndex = 0;
   let lastError: string | null = null;
-  let quotaExhausted = false;
+  // Each role walks its own model chain. A model that runs out of quota, loses its key or keeps failing
+  // is skipped by every section for the rest of this job.
+  const chains: Record<AnalysisRole, { models: string[]; index: number }> = {
+    reader: { models: models.reader, index: 0 },
+    reviewer: { models: models.reviewer, index: 0 },
+    visual: { models: models.visual, index: 0 },
+  };
+  const run: RoleRunner = async (role, signal, task) => {
+    const chain = chains[role];
+    for (let attempt = 1; ; attempt++) {
+      const model = chain.models[chain.index];
+      if (!model) throw new AnalysisError(role === "visual" ? "Footage scanning needs GEMINI_API_KEY." : "No analysis model is configured.");
+      try {
+        const result = await limits[providerOf(model)](() => {
+          signal.throwIfAborted();
+          return task(model);
+        });
+        if (!progress.modelsByRole?.[role]?.includes(model)) {
+          await save((current) => ({ ...current, modelsByRole: { ...current.modelsByRole, [role]: [...(current.modelsByRole?.[role] ?? []), model] } }));
+        }
+        return result;
+      } catch (error) {
+        if (signal.aborted || !(error instanceof AnalysisError)) throw error;
+        if (error.quotaExhausted || error.unavailable || (error.retryable && attempt >= MAX_ATTEMPTS)) {
+          if (chain.models[chain.index] === model && chain.index < chain.models.length - 1) chain.index++;
+          if (chain.models[chain.index] !== model) {
+            console.warn(`Job ${job.id}: ${role} unavailable on ${model} (${error.message}); continuing with ${chain.models[chain.index]}.`);
+            attempt = 0;
+            continue;
+          }
+        }
+        if (!error.retryable || attempt >= MAX_ATTEMPTS) throw error;
+        const wait = Math.min(90_000, (error.retryAfterMs ?? 5000 * 3 ** (attempt - 1)) + Math.random() * 1000);
+        console.warn(`Job ${job.id}: ${role} attempt ${attempt} failed (${error.message}); retrying in ${Math.round(wait / 1000)}s.`);
+        await delay(wait, signal);
+      }
+    }
+  };
 
   if (!progress.transcriptSections?.length) {
     await save((current) => ({ ...current, phase: "fetching_transcript" }));
@@ -86,51 +148,37 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
     }
   }
 
-  async function analyze(window: AnalysisWindow) {
-    for (let attempt = 1; ; attempt++) {
-      const model = models[modelIndex];
-      try {
-        const transcript = progress.transcriptSections?.find((section) => section.window === window.index);
-        if (!transcript) throw new AnalysisError("Existing captions are unavailable for this section. Retry caption retrieval or choose another video.");
-        await save((current) => ({ ...current, phase: "analyzing", modelsUsed: [...new Set([...(current.modelsUsed ?? []), model])] }));
-        const options = {
-          model,
-          signal: controller.signal,
-          context: { profile: progress.profile, labels: highlightLabels(progress.highlights).map((entry) => entry.label) },
-          transcript: transcriptPrompt(transcript),
-        };
-        const draft = await analyzeWindow(job, window, options);
-        await save((current) => ({ ...current, phase: "verifying" }));
-        const verified = await analyzeWindow(job, window, { ...options, draft });
-        return groundHighlights({ ...verified, rejected: draft.rejected + verified.rejected }, transcript);
-      } catch (error) {
-        if (controller.signal.aborted) throw error;
-        if (error instanceof AnalysisError && (error.quotaExhausted || (error.retryable && attempt >= MAX_ATTEMPTS))) {
-          if (models[modelIndex] === model && modelIndex < models.length - 1) modelIndex++;
-          if (models[modelIndex] !== model) {
-            console.warn(`Analysis unavailable on ${model}; continuing with ${models[modelIndex]}.`);
-            attempt = 0;
-            continue;
-          }
-          if (error.quotaExhausted) quotaExhausted = true;
-        }
-        if (!(error instanceof AnalysisError) || !error.retryable || attempt >= MAX_ATTEMPTS) throw error;
-        const wait = Math.min(90_000, (error.retryAfterMs ?? 5000 * 3 ** (attempt - 1)) + Math.random() * 1000);
-        console.warn(`Job ${job.id}: section ${window.index + 1} attempt ${attempt} failed (${error.message}); retrying in ${Math.round(wait / 1000)}s.`);
-        await delay(wait, controller.signal);
-      }
+  // A quick planning read decides whether footage scans are worth their time and shares one label
+  // vocabulary, so every section can start at once.
+  const visualOptions = { visualAvailable: models.visual.length > 0, mode: visualPassMode(process.env.ANALYSIS_VISUAL_PASS) };
+  if (!progress.plan && progress.transcriptSections?.length && !controller.signal.aborted) {
+    await save((current) => ({ ...current, phase: "planning" }));
+    const sample = planningSample(job, progress.transcriptSections);
+    const draft = sample.excerpts.length
+      ? await run("reader", controller.signal, (model) => planAnalysis(job, sample.excerpts, model, controller.signal)).catch((error) => {
+        if (!controller.signal.aborted) console.warn(`Job ${job.id}: planning failed (${error instanceof Error ? error.message : "unexpected error"}); scanning footage by default.`);
+        return null;
+      })
+      : null;
+    if (!controller.signal.aborted) {
+      const decided = choosePlan(draft, sample.coverage, visualOptions);
+      await save((current) => ({ ...current, plan: decided }));
+      console.log(`Job ${job.id}: ${decided.visualReason}`);
     }
   }
+  const plan = progress.plan ?? choosePlan(null, 0, visualOptions);
 
   async function runSection(window: AnalysisWindow) {
     if (controller.signal.aborted || stopping) return;
     try {
-      if (quotaExhausted) throw new AnalysisError(lastError ?? "Gemini's daily quota is used up.", { quotaExhausted: true });
-      const result = await analyze(window);
+      const section = progress.transcriptSections?.find((entry) => entry.window === window.index);
+      if (!section) throw new AnalysisError("Existing captions are unavailable for this section. Retry caption retrieval or choose another video.");
+      const result = await analyzeSection(job, window, section, plan, run, controller.signal);
       if (controller.signal.aborted) return;
       const seconds = window.end - window.start;
       await save((current) => {
-        const windowProfiles = [...current.windowProfiles.filter((entry) => entry.window !== window.index), { window: window.index, seconds, profile: result.profile }];
+        const others = current.windowProfiles.filter((entry) => entry.window !== window.index);
+        const windowProfiles = result.profile ? [...others, { window: window.index, seconds, profile: result.profile }] : others;
         return {
           ...current,
           completedWindows: [...current.completedWindows, window.index].sort((a, b) => a - b),
@@ -141,10 +189,12 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
           highlights: mergeHighlights(current.highlights, result.highlights),
           topics: mergeTopics(current.topics, result.topics),
           rejectedSuggestions: current.rejectedSuggestions + result.rejected,
+          reviewRemoved: (current.reviewRemoved ?? 0) + result.reviewRemoved,
           updatedAt: now(),
         };
       });
-      console.log(`Job ${job.id}: section ${window.index + 1}/${windows.length} done (${result.highlights.length} highlights, ${result.topics.length} topics, ${result.rejected} rejected).`);
+      const { transcriptMs, footageMs } = result.timings;
+      console.log(`Job ${job.id}: section ${window.index + 1}/${windows.length} done (transcript and cross-check ${elapsed(transcriptMs)}, footage ${footageMs === null ? "skipped" : elapsed(footageMs)}; ${result.highlights.length} highlights, ${result.topics.length} topics, ${result.reviewRemoved} removed by cross-check, ${result.rejected} rejected).`);
     } catch (error) {
       if (controller.signal.aborted || stopping) return;
       lastError = error instanceof AnalysisError ? error.message : "Unexpected analysis error.";
@@ -155,12 +205,11 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
   }
 
   const pending = windows.filter((window) => !progress.completedWindows.includes(window.index) && !progress.failedWindows.includes(window.index));
-  console.log(`Analyzing job ${job.id}: ${pending.length} of ${windows.length} section(s), up to ${CONCURRENCY} at a time.`);
-  // With nothing analyzed yet, run one section first so later sections share its content type and labels.
-  if (progress.completedWindows.length === 0 && pending.length > 1) await runSection(pending.shift()!);
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, pending.length) }, async () => {
-    for (let window = pending.shift(); window; window = pending.shift()) await runSection(window);
-  }));
+  if (pending.length && !controller.signal.aborted) {
+    await save((current) => ({ ...current, phase: "analyzing" }));
+    console.log(`Analyzing job ${job.id}: ${pending.length} of ${windows.length} section(s) in parallel${plan.visualPass ? ", with footage scans" : ""}.`);
+    await Promise.all(pending.map(runSection));
+  }
 
   clearInterval(cancelPoll);
   controllers.delete(controller);
@@ -172,21 +221,23 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
   }
   await save((current) => {
     const done = current.completedWindows.length;
-    if (done === current.totalWindows) return { ...current, status: "complete", message: undefined, updatedAt: now() };
+    const finished = { ...current, finishedAt: now(), updatedAt: now() };
+    if (done === current.totalWindows) return { ...finished, status: "complete", message: undefined };
     const missed = current.totalWindows - done;
     return {
-      ...current,
+      ...finished,
       status: done > 0 ? "complete" : "failed",
       message: done > 0 ? `${missed} of ${current.totalWindows} sections could not be analyzed. ${lastError ?? ""}`.trim() : lastError ?? "Analysis failed.",
-      updatedAt: now(),
     };
   });
-  console.log(`Job ${job.id} finished: ${progress.status}.`);
+  console.log(`Job ${job.id} finished: ${progress.status} in ${elapsed(Date.parse(progress.finishedAt!) - Date.parse(progress.startedAt!))}.`);
 }
 
 async function main() {
-  if (!process.env.GEMINI_API_KEY) throw new Error("Set GEMINI_API_KEY in .env.local before starting the analysis worker.");
-  const models = configuredModels();
+  if (!process.env.GEMINI_API_KEY && !process.env.ANTHROPIC_API_KEY) {
+    throw new Error("Set GEMINI_API_KEY and/or ANTHROPIC_API_KEY in .env.local before starting the analysis worker.");
+  }
+  const models = roleModels();
   // Set when the website started this worker: stop with it, and wait out a restarting server's old worker.
   const parentPid = Number(process.env.ANALYSIS_WORKER_PARENT_PID) || null;
   for (let attempt = 1; ; attempt++) {
@@ -217,7 +268,8 @@ async function main() {
   }
   await writeHeartbeat();
   const heartbeat = setInterval(() => void writeHeartbeat().catch(() => undefined), 5000);
-  console.log(`Video analysis worker ready (${models.join(" -> ")}). Waiting for jobs.`);
+  const chain = (list: string[]) => list.join(" -> ") || "off";
+  console.log(`Video analysis worker ready (transcript: ${chain(models.reader)}; cross-check: ${chain(models.reviewer)}; footage: ${chain(models.visual)}). Waiting for jobs.`);
   let lastCleanup = 0;
   try {
     while (!stopping) {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AnalysisWindow, WindowResult } from "./schema.ts";
+import type { AnalysisWindow } from "./schema.ts";
 import type { TranscriptSection, TranscriptSegment } from "./shared.ts";
 
 export function parseNativeTranscript(input: unknown, duration: number) {
@@ -55,13 +55,4 @@ export function transcriptForWindow(native: { language: string; segments: Transc
 
 export function transcriptPrompt(section: TranscriptSection): string {
   return JSON.stringify({ source: section.source, language: section.language, cues: section.segments });
-}
-
-/** Speech evidence must land on an actual cue. Visual events may occur in silent sections. */
-export function groundHighlights(result: WindowResult, section: TranscriptSection): WindowResult {
-  const highlights = result.highlights.filter((item) => item.evidence.source !== "speech" || section.segments.some((cue) =>
-    cue.startSeconds <= item.evidence.atSeconds && cue.endSeconds >= item.evidence.atSeconds
-    && cue.startSeconds < item.endSeconds && cue.endSeconds > item.startSeconds));
-  const topics = result.topics.filter((topic) => section.segments.some((cue) => cue.startSeconds < topic.endSeconds && cue.endSeconds > topic.startSeconds));
-  return { ...result, highlights, topics, rejected: result.rejected + result.highlights.length - highlights.length + result.topics.length - topics.length };
 }

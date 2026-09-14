@@ -1,33 +1,37 @@
 import { z } from "zod";
-import { CONTENT_TYPES, EVIDENCE_SOURCES, MAX_VIDEO_SECONDS, STRENGTHS, normalizeLabel } from "./shared.ts";
+import { CONTENT_TYPES, EVIDENCE_SOURCES, FOOTAGE_EVIDENCE_SOURCES, MAX_VIDEO_SECONDS, STRENGTHS, normalizeLabel } from "./shared.ts";
 import type { AnalysisProgress, ContentType, Highlight, TopicChapter, VideoProfile } from "./shared.ts";
 
 export * from "./shared.ts";
 
 export const JOB_TTL_MS = 24 * 60 * 60 * 1000;
-export const JOB_VERSION = 4;
+export const JOB_VERSION = 5;
 
 export function analysisSetupMessage(env: Record<string, string | undefined> = process.env): string | null {
-  const missing = ["YOUTUBE_API_KEY", "SUPADATA_API_KEY", "GEMINI_API_KEY"].filter((name) => !env[name]);
+  const missing = ["YOUTUBE_API_KEY", "SUPADATA_API_KEY"].filter((name) => !env[name]);
+  if (!env.GEMINI_API_KEY && !env.ANTHROPIC_API_KEY) missing.push("GEMINI_API_KEY or ANTHROPIC_API_KEY");
   return missing.length ? `Connect existing YouTube captions and analysis by adding ${missing.join(", ")} to the server environment, then restart the website.` : null;
 }
 /** Preceding footage included in each later section so boundary moments keep their lead-in. */
 export const WINDOW_OVERLAP_SECONDS = 10;
 export const MAX_WINDOW_SECONDS = 3600;
 const MIN_WINDOW_SECONDS = 300;
-const TOLERANCE_SECONDS = 2;
-const MAX_HIGHLIGHT_SECONDS = 300;
+export const TOLERANCE_SECONDS = 2;
+export const MAX_HIGHLIGHT_SECONDS = 300;
 
 export class AnalysisError extends Error {
   retryable: boolean;
   retryAfterMs: number | null;
   quotaExhausted: boolean;
-  constructor(message: string, options: { retryable?: boolean; retryAfterMs?: number | null; quotaExhausted?: boolean } = {}) {
+  /** The model can't serve this job (missing or rejected key), so the worker moves to the role's next model. */
+  unavailable: boolean;
+  constructor(message: string, options: { retryable?: boolean; retryAfterMs?: number | null; quotaExhausted?: boolean; unavailable?: boolean } = {}) {
     super(message);
     this.name = "AnalysisError";
     this.retryable = options.retryable ?? false;
     this.retryAfterMs = options.retryAfterMs ?? null;
     this.quotaExhausted = options.quotaExhausted ?? false;
+    this.unavailable = options.unavailable ?? false;
   }
 }
 
@@ -80,17 +84,61 @@ export const MAX_HIGHLIGHTS_PER_WINDOW = 30;
 export const MAX_TOPICS_PER_WINDOW = 40;
 
 /**
- * Shape requested from Gemini. Verified live: the API rejects this schema with "invalid argument"
+ * Shape requested from the footage scan. Verified live: Gemini rejects a schema with "invalid argument"
  * when arrays carry maxItems, so array limits live in the prompt and are enforced in validateWindow.
  */
-export const ModelResponseSchema = z.object({
+export const VisualResponseSchema = z.object({
   contentType: z.enum(CONTENT_TYPES),
   contentLabel: z.string().min(1).max(60),
   speechDriven: z.boolean(),
   summary: z.string().min(1).max(400),
   inspectedWholeRange: z.boolean(),
-  highlights: z.array(HighlightItem),
-  topics: z.array(TopicItem),
+  highlights: z.array(HighlightItem.extend({ evidenceSource: z.enum(FOOTAGE_EVIDENCE_SOURCES) })),
+});
+
+// Text-role wire schemas are deliberately loose (no lengths, ranges or integer bounds): Claude's
+// structured outputs and Gemini's JSON schema support differ, so limits are enforced per item in
+// pipeline.ts, where one bad suggestion is discarded instead of failing a whole section.
+const Profile = {
+  contentType: z.enum(CONTENT_TYPES),
+  contentLabel: z.string().describe("A short description of this kind of video, under 60 characters"),
+  speechDriven: z.boolean(),
+};
+
+export const PlanResponseSchema = z.object({
+  ...Profile,
+  visualMomentsMatter: z.boolean().describe("True when clip-worthy moments are likely to be things seen on screen (plays, crashes, stunts, reactions) rather than things said"),
+  labels: z.array(z.string()).describe("Up to 10 short title-case kinds of highlight suited to this video"),
+});
+
+export const ReaderResponseSchema = z.object({
+  ...Profile,
+  summary: z.string().describe("One sentence describing this section"),
+  highlights: z.array(z.object({
+    startCue: z.number(),
+    endCue: z.number(),
+    evidenceCue: z.number(),
+    label: z.string().describe("1-3 word title-case kind of moment, e.g. Hot Take, Story, Advice"),
+    title: z.string(),
+    summary: z.string().describe("Why this moment stands out, paraphrased"),
+    strength: z.enum(STRENGTHS).describe("How clip-worthy the content itself is; not a popularity prediction"),
+    evidence: z.string().describe("What is said at evidenceCue, paraphrased"),
+  })),
+  topics: z.array(z.object({ startCue: z.number(), endCue: z.number(), title: z.string(), summary: z.string() })),
+});
+
+export const REVIEW_VERDICTS = ["keep", "revise", "reject"] as const;
+export const ReviewResponseSchema = z.object({
+  decisions: z.array(z.object({
+    id: z.string(),
+    verdict: z.enum(REVIEW_VERDICTS),
+    start: z.number().optional().describe("Revised start in seconds from the start of the original video"),
+    end: z.number().optional().describe("Revised end in seconds from the start of the original video"),
+    label: z.string().optional(),
+    title: z.string().optional(),
+    summary: z.string().optional(),
+    strength: z.enum(STRENGTHS).optional(),
+  })),
 });
 
 // Parsing is per item so one malformed suggestion is discarded instead of failing the whole section.
@@ -101,7 +149,7 @@ const Envelope = z.object({
   summary: z.string(),
   inspectedWholeRange: z.boolean(),
   highlights: z.array(z.unknown()),
-  topics: z.array(z.unknown()),
+  topics: z.array(z.unknown()).default([]),
 });
 
 export function clampWindowSeconds(value: unknown): number {

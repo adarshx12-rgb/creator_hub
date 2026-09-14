@@ -8,9 +8,9 @@ import { formatTimecode } from "@/lib/format";
 import { addSavedMoment } from "@/lib/local-store";
 import type { SearchResult } from "@/lib/types";
 import {
-  CONTENT_TYPE_LABELS, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, highlightLabels, normalizeLabel, topHighlights,
+  ANALYSIS_ROLES, CONTENT_TYPE_LABELS, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, highlightLabels, normalizeLabel, topHighlights,
 } from "@/lib/analysis/shared";
-import type { AnalysisState, Highlight, TopicChapter } from "@/lib/analysis/shared";
+import type { AnalysisRole, AnalysisState, Highlight, TopicChapter } from "@/lib/analysis/shared";
 import { HighlightTimeline } from "./HighlightTimeline";
 import { TranscriptPanel } from "./TranscriptPanel";
 
@@ -21,6 +21,7 @@ const STRENGTH_STYLE = {
   low: "bg-surface-hover text-text-muted",
 };
 const SOURCE_LABEL = { speech: "heard", visual: "seen", on_screen_text: "on-screen text", sound: "sound" };
+const ROLE_LABEL: Record<AnalysisRole, string> = { reader: "Transcript", reviewer: "Cross-check", visual: "Footage" };
 
 type Selection = { kind: "highlight"; item: Highlight } | { kind: "topic"; item: TopicChapter };
 
@@ -59,7 +60,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
   const [end, setEnd] = useState(0);
   const [saved, setSaved] = useState(false);
   const reviewRef = useRef<HTMLDivElement>(null);
-  const storageKey = `momentscout:analysis:v4:${video.provider}:${video.id}`;
+  const storageKey = `momentscout:analysis:v5:${video.provider}:${video.id}`;
   const active = Boolean(state && ACTIVE.includes(state.status));
   const busy = submitting || pendingRetry || active || Boolean(jobId && !state && !error);
 
@@ -200,9 +201,15 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
 
   const statusText = !state ? "" : pendingRetry ? "Retrying missed sections…"
     : state.status === "queued" ? "Queued"
-    : state.status === "running" ? (state.totalWindows > 1 ? `Analyzing section ${Math.min(state.completedWindows.length + 1, state.totalWindows)} of ${state.totalWindows}…` : "Watching the whole video…")
+    : state.status === "running" ? (state.totalWindows > 1 ? `Analyzing ${state.totalWindows} sections in parallel · ${state.completedWindows.length} done…` : "Analyzing the video…")
     : state.status === "complete" ? (state.failedWindows.length ? "Partly analyzed" : "Analysis complete")
     : state.status === "failed" ? "Analysis failed" : "Cancelled";
+  const modelSummary = ANALYSIS_ROLES.flatMap((role) => {
+    const models = state?.modelsByRole?.[role];
+    return models?.length ? [`${ROLE_LABEL[role]}: ${models.join(", ")}`] : [];
+  }).join(" · ");
+  const runSeconds = state?.status === "complete" && state.startedAt && state.finishedAt
+    ? Math.max(0, (Date.parse(state.finishedAt) - Date.parse(state.startedAt)) / 1000) : null;
 
   return (
     <section className="rounded-lg border border-border bg-surface p-4 sm:p-5" aria-labelledby="ai-breakdown-heading">
@@ -211,7 +218,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 id="ai-breakdown-heading" className="flex items-center gap-2 text-sm font-medium"><BrainCircuit size={16} className="text-accent" /> AI video breakdown</h3>
-          <p className="mt-1.5 max-w-lg text-xs leading-relaxed text-text-muted">Transcripts load automatically. AI analyzes the words and footage, then re-checks key moments and promising clips against the source.</p>
+          <p className="mt-1.5 max-w-lg text-xs leading-relaxed text-text-muted">Transcripts load automatically. One AI pass finds spoken moments in the captions and a second cross-checks each one; Gemini scans the footage when moments are likely to be visual.</p>
         </div>
         <span className="rounded bg-accent-soft px-2 py-1 text-[10px] text-accent">AI suggestions</span>
       </div>
@@ -227,7 +234,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
           </Button>
         )}
         {(active || pendingRetry) && jobId && <Button size="sm" onClick={cancel}>Cancel</Button>}
-        <span className="text-[11px] text-text-muted">Up to 2 hours · uses your Gemini quota</span>
+        <span className="text-[11px] text-text-muted">Up to 2 hours · uses your configured AI services</span>
       </div>
       <p className="mt-2 text-[11px] text-text-muted">Analysis starts when you open a video. Transcript and video analysis use the configured services. Results are kept for 24 hours.</p>
       {error && <p role="alert" className="mt-3 text-xs text-danger">{error}</p>}
@@ -239,8 +246,17 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
             <span>{statusText}</span>
             {state.totalWindows > 1 && <span className="font-mono text-text-muted">{formatTimecode(state.coveredSeconds)} / {formatTimecode(state.durationSeconds)}</span>}
           </div>
-          {state.status === "running" && state.phase && <p className="mt-1 text-xs text-accent" role="status">{{ fetching_transcript: "Fetching timestamped captions…", analyzing: "Finding key and potential moments…", verifying: "Checking suggested moments against the source…" }[state.phase]}</p>}
+          {state.status === "running" && state.phase && <p className="mt-1 text-xs text-accent" role="status">{{
+            fetching_transcript: "Fetching timestamped captions…",
+            planning: "Reading caption samples to plan the analysis…",
+            analyzing: state.plan?.visualPass
+              ? "Reading the transcript and scanning the footage; spoken moments are cross-checked before they appear…"
+              : "Reading the transcript; spoken moments are cross-checked before they appear…",
+          }[state.phase]}</p>}
           {state.transcriptNotice && <p className="mt-2 text-[11px] text-text-muted">{state.transcriptNotice}</p>}
+          {state.plan && <p className="mt-2 text-[11px] text-text-muted">{state.plan.visualReason}</p>}
+          {modelSummary && <p className="mt-1 text-[11px] text-text-faint">Models · {modelSummary}</p>}
+          {runSeconds !== null && <p className="mt-1 text-[11px] text-text-faint">Latest run took {formatTimecode(runSeconds)}.</p>}
           {state.totalWindows > 1
             ? <progress className="mt-2 h-1.5 w-full accent-accent" value={state.coveredSeconds} max={state.durationSeconds} aria-label="Video duration analyzed" />
             : (active || pendingRetry) && <p className="mt-1 text-[11px] text-text-muted">Existing captions are fetched, analyzed, and checked before highlights appear.</p>}
@@ -259,7 +275,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
             <span className="font-medium">{state.profile.contentLabel}</span>
           </div>
           <p className="mt-2 text-xs leading-relaxed text-text-muted">{state.profile.summary}</p>
-          <p className="mt-1 text-[10px] text-text-faint">Video type detected by AI from the footage.</p>
+          <p className="mt-1 text-[10px] text-text-faint">Video type estimated by AI from the captions{state.plan?.visualPass ? " and footage" : ""}.</p>
         </div>
       )}
 
@@ -345,6 +361,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
           <p className="mt-2 text-[11px] text-text-muted">
             Timestamps, summaries, and evidence are AI estimates written as paraphrases, not quotes. Preview before clipping.
             {state.rejectedSuggestions > 0 && ` ${state.rejectedSuggestions} suggestion${state.rejectedSuggestions === 1 ? " was" : "s were"} discarded for invalid timestamps.`}
+            {(state.reviewRemoved ?? 0) > 0 && ` ${state.reviewRemoved} suggested moment${state.reviewRemoved === 1 ? " was" : "s were"} removed after cross-checking against the captions.`}
           </p>
         </>
       )}

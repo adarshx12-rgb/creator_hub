@@ -38,9 +38,9 @@ function capabilitiesFor(embeddable: boolean | undefined, privacyStatus: string 
   }
   return {
     canPreview: true,
-    canAnalyze: Boolean(process.env.GEMINI_API_KEY && process.env.SUPADATA_API_KEY),
+    canAnalyze: Boolean(process.env.SUPADATA_API_KEY && (process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY)),
     canExport: false,
-    capabilityReason: "Official playback. AI analysis uses Gemini's public YouTube video input when configured; export requires an authorized upload.",
+    capabilityReason: "Official playback. AI analysis reads existing captions and, when Gemini is configured, its public YouTube video input; export requires an authorized upload.",
     evidenceType: "metadata",
   };
 }

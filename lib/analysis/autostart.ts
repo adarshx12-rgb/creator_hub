@@ -4,7 +4,7 @@ import { join } from "node:path";
 /** Why the website should not start the analysis worker itself, or null when it should. */
 export function autostartBlocker(env: Record<string, string | undefined>): string | null {
   if (["0", "false", "off"].includes((env.ANALYSIS_WORKER_AUTOSTART ?? "").trim().toLowerCase())) return "ANALYSIS_WORKER_AUTOSTART is off";
-  if (!env.GEMINI_API_KEY) return "GEMINI_API_KEY is not set";
+  if (!env.GEMINI_API_KEY && !env.ANTHROPIC_API_KEY) return "neither GEMINI_API_KEY nor ANTHROPIC_API_KEY is set";
   if (env.NEXT_PHASE === "phase-production-build") return "the app is building";
   return null;
 }

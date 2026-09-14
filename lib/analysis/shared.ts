@@ -39,6 +39,23 @@ export const STRENGTHS = ["high", "medium", "low"] as const;
 export type Strength = (typeof STRENGTHS)[number];
 export const EVIDENCE_SOURCES = ["speech", "visual", "on_screen_text", "sound"] as const;
 export type EvidenceSource = (typeof EVIDENCE_SOURCES)[number];
+/** Evidence the footage scan may report; spoken moments come from the transcript reader. */
+export const FOOTAGE_EVIDENCE_SOURCES = ["visual", "on_screen_text", "sound"] as const;
+
+/**
+ * Models cowork by role: a reader plans the job and finds spoken moments in the captions, a reviewer
+ * cross-checks those moments, and a video model scans footage for moments that are seen rather than said.
+ */
+export const ANALYSIS_ROLES = ["reader", "reviewer", "visual"] as const;
+export type AnalysisRole = (typeof ANALYSIS_ROLES)[number];
+
+export interface AnalysisPlan {
+  /** Whether sections get a footage scan in addition to the transcript reading. */
+  visualPass: boolean;
+  visualReason: string;
+  /** Shared highlight vocabulary so sections analyzed in parallel label moments consistently. */
+  labels: string[];
+}
 
 export interface VideoProfile {
   contentType: ContentType;
@@ -83,10 +100,16 @@ export interface TranscriptSection {
 export type AnalysisStatus = "queued" | "running" | "complete" | "failed" | "cancelled";
 
 export interface AnalysisProgress {
-  phase?: "fetching_transcript" | "analyzing" | "verifying";
+  phase?: "fetching_transcript" | "planning" | "analyzing";
   transcriptSections?: TranscriptSection[];
   transcriptNotice?: string;
-  modelsUsed?: string[];
+  plan?: AnalysisPlan;
+  modelsByRole?: Partial<Record<AnalysisRole, string[]>>;
+  /** Transcript moments the reviewer rejected as unsupported, misleading, duplicate or weak. */
+  reviewRemoved?: number;
+  /** Measured wall-clock bounds of the latest run, for display. */
+  startedAt?: string;
+  finishedAt?: string;
   status: AnalysisStatus;
   totalWindows: number;
   completedWindows: number[];
