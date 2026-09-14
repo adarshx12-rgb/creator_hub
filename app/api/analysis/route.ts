@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { NextRequest, NextResponse } from "next/server";
-import { CreateAnalysisSchema, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, clampWindowSeconds } from "@/lib/analysis/schema";
+import { CreateAnalysisSchema, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, analysisSetupMessage, clampWindowSeconds } from "@/lib/analysis/schema";
 import { analysisRoot, cancelJob, createJob, getJob, getProgress, isWorkerOnline, listJobs, requestRetry } from "@/lib/analysis/store";
 import { getYoutubeVideo } from "@/lib/youtube";
 
@@ -38,7 +38,7 @@ export async function GET(request: NextRequest) {
   const owner = ownerOf(request);
   const id = request.nextUrl.searchParams.get("id");
   const workerOnline = await isWorkerOnline();
-  if (!id) return reply({ configured: Boolean(process.env.GEMINI_API_KEY && process.env.YOUTUBE_API_KEY), maxDurationSeconds: MAX_VIDEO_SECONDS, workerOnline });
+  if (!id) return reply({ configured: !analysisSetupMessage(process.env), setupMessage: analysisSetupMessage(process.env), maxDurationSeconds: MAX_VIDEO_SECONDS, workerOnline });
   const job = await getJob(id);
   if (!owner || !job || job.owner !== owner) return reply({ message: "Analysis not found or expired." }, 404);
   return reply({ id: job.id, durationSeconds: job.durationSeconds, ...await getProgress(job), workerOnline });
@@ -49,7 +49,8 @@ export async function POST(request: NextRequest) {
   let input;
   try { input = CreateAnalysisSchema.parse(await smallBody(request)); }
   catch { return reply({ message: "Supply a valid YouTube video ID." }, 400); }
-  if (!process.env.GEMINI_API_KEY || !process.env.YOUTUBE_API_KEY) return reply({ message: "Add GEMINI_API_KEY and YOUTUBE_API_KEY to .env.local, then start the analysis worker." }, 503);
+  const setupMessage = analysisSetupMessage(process.env);
+  if (setupMessage) return reply({ message: setupMessage }, 503);
   const newToken = randomBytes(32).toString("hex");
   const owner = ownerOf(request) ?? createHash("sha256").update(newToken).digest("hex");
   const creationLock = join(analysisRoot, "create.lock");

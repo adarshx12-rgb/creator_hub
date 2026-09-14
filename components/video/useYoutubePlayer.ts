@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface YTPlayer {
   getCurrentTime: () => number;
   seekTo: (seconds: number, allowSeekAhead: boolean) => void;
   playVideo: () => void;
+  pauseVideo: () => void;
   destroy: () => void;
 }
 
@@ -51,6 +52,33 @@ export function useYoutubePlayer(videoId: string, enabled: boolean, startSeconds
   const containerRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YTPlayer | null>(null);
   const [ready, setReady] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const previewEnd = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!ready) return;
+    const timer = setInterval(() => {
+      const time = playerRef.current?.getCurrentTime() ?? 0;
+      setCurrentTime(time);
+      if (previewEnd.current !== null && time >= previewEnd.current) {
+        playerRef.current?.pauseVideo();
+        previewEnd.current = null;
+      }
+    }, 150);
+    return () => clearInterval(timer);
+  }, [ready]);
+
+  const seekTo = useCallback((seconds: number) => {
+    previewEnd.current = null;
+    playerRef.current?.seekTo(seconds, true);
+    playerRef.current?.playVideo();
+  }, []);
+  const previewRange = useCallback((start: number, end: number) => {
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return;
+    previewEnd.current = end;
+    playerRef.current?.seekTo(start, true);
+    playerRef.current?.playVideo();
+  }, []);
 
   useEffect(() => {
     if (!enabled) return;
@@ -77,6 +105,7 @@ export function useYoutubePlayer(videoId: string, enabled: boolean, startSeconds
       destroyed = true;
       playerRef.current?.destroy?.();
       playerRef.current = null;
+      previewEnd.current = null;
       setReady(false);
     };
     // startSeconds intentionally excluded - it should only seed the initial load, not re-init the player.
@@ -86,10 +115,9 @@ export function useYoutubePlayer(videoId: string, enabled: boolean, startSeconds
   return {
     containerRef,
     ready,
+    currentTime,
+    previewRange,
     getCurrentTime: () => playerRef.current?.getCurrentTime() ?? 0,
-    seekTo: (seconds: number) => {
-      playerRef.current?.seekTo(seconds, true);
-      playerRef.current?.playVideo();
-    },
+    seekTo,
   };
 }

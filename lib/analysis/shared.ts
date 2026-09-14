@@ -66,9 +66,27 @@ export interface TopicChapter {
   summary: string;
 }
 
+export interface TranscriptSegment {
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+}
+
+export interface TranscriptSection {
+  window: number;
+  source: "youtube_captions";
+  language: string;
+  segments: TranscriptSegment[];
+  model?: string;
+}
+
 export type AnalysisStatus = "queued" | "running" | "complete" | "failed" | "cancelled";
 
 export interface AnalysisProgress {
+  phase?: "fetching_transcript" | "analyzing" | "verifying";
+  transcriptSections?: TranscriptSection[];
+  transcriptNotice?: string;
+  modelsUsed?: string[];
   status: AnalysisStatus;
   totalWindows: number;
   completedWindows: number[];

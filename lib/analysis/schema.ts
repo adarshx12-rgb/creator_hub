@@ -5,7 +5,12 @@ import type { AnalysisProgress, ContentType, Highlight, TopicChapter, VideoProfi
 export * from "./shared.ts";
 
 export const JOB_TTL_MS = 24 * 60 * 60 * 1000;
-export const JOB_VERSION = 2;
+export const JOB_VERSION = 4;
+
+export function analysisSetupMessage(env: Record<string, string | undefined> = process.env): string | null {
+  const missing = ["YOUTUBE_API_KEY", "SUPADATA_API_KEY", "GEMINI_API_KEY"].filter((name) => !env[name]);
+  return missing.length ? `Connect existing YouTube captions and analysis by adding ${missing.join(", ")} to the server environment, then restart the website.` : null;
+}
 /** Preceding footage included in each later section so boundary moments keep their lead-in. */
 export const WINDOW_OVERLAP_SECONDS = 10;
 export const MAX_WINDOW_SECONDS = 3600;
@@ -101,7 +106,7 @@ const Envelope = z.object({
 
 export function clampWindowSeconds(value: unknown): number {
   const parsed = Math.floor(Number(value));
-  if (!Number.isFinite(parsed) || parsed <= 0) return MAX_WINDOW_SECONDS;
+  if (!Number.isFinite(parsed) || parsed <= 0) return 600;
   return Math.min(MAX_WINDOW_SECONDS, Math.max(MIN_WINDOW_SECONDS, parsed));
 }
 
@@ -142,7 +147,7 @@ export interface WindowResult {
   rejected: number;
 }
 
-export function validateWindow(input: unknown, window: AnalysisWindow, duration: number): WindowResult {
+export function validateWindow(input: unknown, window: AnalysisWindow, duration: number, strictTimestamps = false): WindowResult {
   const envelope = Envelope.safeParse(input);
   if (!envelope.success) throw new AnalysisError("The model returned an analysis in an unexpected format.", { retryable: true });
   const data = envelope.data;
@@ -167,7 +172,7 @@ export function validateWindow(input: unknown, window: AnalysisWindow, duration:
   // excerpt (every start fits the excerpt length and some fall before the excerpt), shift it.
   const starts = [...highlightItems, ...topicItems].map((item) => parseTimestamp(item.start)).filter((value) => value !== null);
   const excerptLength = window.end - window.inputStart;
-  const offset = window.inputStart > 0 && starts.length > 0
+  const offset = !strictTimestamps && window.inputStart > 0 && starts.length > 0
     && starts.every((value) => value <= excerptLength + TOLERANCE_SECONDS)
     && starts.some((value) => value < window.inputStart - TOLERANCE_SECONDS) ? window.inputStart : 0;
 

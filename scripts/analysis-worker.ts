@@ -6,6 +6,7 @@ import {
 import { AnalysisError, MAX_RETRY_ROUNDS, analysisWindows, highlightLabels, mergeHighlights, mergeTopics, pickProfile } from "../lib/analysis/schema.ts";
 import type { AnalysisJob, AnalysisProgress, AnalysisWindow } from "../lib/analysis/schema.ts";
 import { analyzeWindow, configuredModels } from "../lib/analysis/gemini.ts";
+import { fetchNativeTranscript, groundHighlights, transcriptForWindow, transcriptPrompt } from "../lib/analysis/transcript.ts";
 
 // A single local worker owns progress writes. Requests only create jobs and cancel/retry flags.
 const CONCURRENCY = Math.min(4, Math.max(1, Math.floor(Number(process.env.ANALYSIS_CONCURRENCY)) || 2));
@@ -40,7 +41,7 @@ async function acquireLock() {
     if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Worker lock is incomplete. Check no worker is running before removing .data/analysis/worker.lock.");
     let live = true;
     try { process.kill(pid, 0); } catch (killError) { if ((killError as NodeJS.ErrnoException).code === "ESRCH") live = false; }
-    if (live) throw new Error("An analysis worker is already running.");
+    if (live) throw Object.assign(new Error("An analysis worker is already running."), { code: "LOCK_HELD" });
     await rm(workerLock, { recursive: true, force: true });
     await mkdir(workerLock);
   }
@@ -70,25 +71,48 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
   let lastError: string | null = null;
   let quotaExhausted = false;
 
+  if (!progress.transcriptSections?.length) {
+    await save((current) => ({ ...current, phase: "fetching_transcript" }));
+    const fetched = await fetchNativeTranscript(job.videoId, job.durationSeconds, controller.signal).catch((error) => {
+      if (!controller.signal.aborted) throw error;
+      return null;
+    });
+    if (fetched) {
+      if (!fetched.transcript) lastError = fetched.notice ?? "Existing captions are unavailable for this video.";
+      await save((current) => ({ ...current, transcriptNotice: fetched.notice,
+        transcriptSections: fetched.transcript ? windows.map((window) => transcriptForWindow(fetched.transcript!, window)) : [],
+        failedWindows: fetched.transcript ? current.failedWindows : windows.map((window) => window.index),
+      }));
+    }
+  }
+
   async function analyze(window: AnalysisWindow) {
     for (let attempt = 1; ; attempt++) {
       const model = models[modelIndex];
       try {
-        return await analyzeWindow(job, window, {
+        const transcript = progress.transcriptSections?.find((section) => section.window === window.index);
+        if (!transcript) throw new AnalysisError("Existing captions are unavailable for this section. Retry caption retrieval or choose another video.");
+        await save((current) => ({ ...current, phase: "analyzing", modelsUsed: [...new Set([...(current.modelsUsed ?? []), model])] }));
+        const options = {
           model,
           signal: controller.signal,
           context: { profile: progress.profile, labels: highlightLabels(progress.highlights).map((entry) => entry.label) },
-        });
+          transcript: transcriptPrompt(transcript),
+        };
+        const draft = await analyzeWindow(job, window, options);
+        await save((current) => ({ ...current, phase: "verifying" }));
+        const verified = await analyzeWindow(job, window, { ...options, draft });
+        return groundHighlights({ ...verified, rejected: draft.rejected + verified.rejected }, transcript);
       } catch (error) {
         if (controller.signal.aborted) throw error;
-        if (error instanceof AnalysisError && error.quotaExhausted) {
+        if (error instanceof AnalysisError && (error.quotaExhausted || (error.retryable && attempt >= MAX_ATTEMPTS))) {
           if (models[modelIndex] === model && modelIndex < models.length - 1) modelIndex++;
           if (models[modelIndex] !== model) {
-            console.warn(`Daily quota used up for ${model}; continuing with ${models[modelIndex]}.`);
-            attempt--;
+            console.warn(`Analysis unavailable on ${model}; continuing with ${models[modelIndex]}.`);
+            attempt = 0;
             continue;
           }
-          quotaExhausted = true;
+          if (error.quotaExhausted) quotaExhausted = true;
         }
         if (!(error instanceof AnalysisError) || !error.retryable || attempt >= MAX_ATTEMPTS) throw error;
         const wait = Math.min(90_000, (error.retryAfterMs ?? 5000 * 3 ** (attempt - 1)) + Math.random() * 1000);
@@ -163,7 +187,34 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: s
 async function main() {
   if (!process.env.GEMINI_API_KEY) throw new Error("Set GEMINI_API_KEY in .env.local before starting the analysis worker.");
   const models = configuredModels();
-  await acquireLock();
+  // Set when the website started this worker: stop with it, and wait out a restarting server's old worker.
+  const parentPid = Number(process.env.ANALYSIS_WORKER_PARENT_PID) || null;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await acquireLock();
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "LOCK_HELD" || !parentPid) throw error;
+      if (attempt >= 15) {
+        console.log("[analysis] Another analysis worker is already running; using that one.");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+  if (parentPid) {
+    const watchParent = setInterval(() => {
+      try {
+        process.kill(parentPid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+        clearInterval(watchParent);
+        stopping = true;
+        for (const controller of controllers) controller.abort();
+      }
+    }, 3000);
+    watchParent.unref();
+  }
   await writeHeartbeat();
   const heartbeat = setInterval(() => void writeHeartbeat().catch(() => undefined), 5000);
   console.log(`Video analysis worker ready (${models.join(" -> ")}). Waiting for jobs.`);

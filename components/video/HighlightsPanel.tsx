@@ -11,6 +11,8 @@ import {
   CONTENT_TYPE_LABELS, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, highlightLabels, normalizeLabel, topHighlights,
 } from "@/lib/analysis/shared";
 import type { AnalysisState, Highlight, TopicChapter } from "@/lib/analysis/shared";
+import { HighlightTimeline } from "./HighlightTimeline";
+import { TranscriptPanel } from "./TranscriptPanel";
 
 const ACTIVE = ["queued", "running"];
 const STRENGTH_STYLE = {
@@ -26,10 +28,22 @@ function range(item: { startSeconds: number; endSeconds: number }) {
   return `${formatTimecode(item.startSeconds)}–${formatTimecode(item.endSeconds)}`;
 }
 
-export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
+async function queueAnalysis(video: SearchResult, retryFailed = false): Promise<string> {
+  const response = await fetch("/api/analysis", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: video.provider, videoId: video.id, ...(retryFailed ? { retryFailed: true } : {}) }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || "Could not start analysis.");
+  return data.id;
+}
+
+export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTime, previewRange }: {
   video: SearchResult; seekTo: (seconds: number) => void; playerReady: boolean; onSaved: () => void;
+  currentTime: number; previewRange: (start: number, end: number) => void;
 }) {
   const [configured, setConfigured] = useState<boolean | null>(null);
+  const [setupMessage, setSetupMessage] = useState("");
   const [workerOnline, setWorkerOnline] = useState<boolean | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
   const [state, setState] = useState<AnalysisState | null>(null);
@@ -45,24 +59,39 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
   const [end, setEnd] = useState(0);
   const [saved, setSaved] = useState(false);
   const reviewRef = useRef<HTMLDivElement>(null);
-  const storageKey = `momentscout:analysis:v2:${video.provider}:${video.id}`;
+  const storageKey = `momentscout:analysis:v4:${video.provider}:${video.id}`;
   const active = Boolean(state && ACTIVE.includes(state.status));
   const busy = submitting || pendingRetry || active || Boolean(jobId && !state && !error);
 
   useEffect(() => {
     let current = true;
-    fetch("/api/analysis").then((res) => res.json()).then((data) => {
+    let stored: string | null = null;
+    try { stored = window.sessionStorage.getItem(storageKey); } catch { /* Storage optional. */ }
+    fetch("/api/analysis").then((res) => {
+      if (!res.ok) throw new Error("Analysis service unavailable");
+      return res.json();
+    }).then(async (data) => {
       if (!current) return;
       setConfigured(data.configured === true);
+      setSetupMessage(typeof data.setupMessage === "string" ? data.setupMessage : "Caption analysis is not connected yet.");
       setWorkerOnline(data.workerOnline === true);
+      if (!stored && data.configured && video.provider === "youtube" && video.capabilities.canAnalyze
+        && video.durationSeconds && video.durationSeconds <= MAX_VIDEO_SECONDS) {
+        setSubmitting(true);
+        try {
+          const id = await queueAnalysis(video);
+          try { window.sessionStorage.setItem(storageKey, id); } catch { /* Storage optional. */ }
+          if (current) setJobId(id);
+        } catch (caught) {
+          if (current) setError(caught instanceof Error ? caught.message : "Could not start analysis.");
+        } finally { if (current) setSubmitting(false); }
+      }
     }).catch(() => { if (current) setError("Could not check the analysis service. Refresh to retry."); });
-    let stored = null;
-    try { stored = window.sessionStorage.getItem(storageKey); } catch { /* Storage optional. */ }
     // Restore only the job reference; analysis data stays in owner-scoped server storage.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setJobId(stored);
     return () => { current = false; };
-  }, [storageKey]);
+  }, [storageKey, video]);
 
   useEffect(() => {
     if (!jobId) return;
@@ -97,16 +126,11 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
   async function analyze(retryFailed = false) {
     setSubmitting(true); setError("");
     try {
-      const response = await fetch("/api/analysis", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: video.provider, videoId: video.id, ...(retryFailed ? { retryFailed: true } : {}) }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Could not start analysis.");
+      const id = await queueAnalysis(video, retryFailed);
       if (retryFailed) setPendingRetry(true);
-      else if (data.id !== jobId) { setState(null); setSelected(null); }
-      setJobId(data.id);
-      try { sessionStorage.setItem(storageKey, data.id); } catch { /* Storage optional. */ }
+      else if (id !== jobId) { setState(null); setSelected(null); }
+      setJobId(id);
+      try { sessionStorage.setItem(storageKey, id); } catch { /* Storage optional. */ }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not start analysis.");
     } finally {
@@ -127,7 +151,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
 
   function inspect(selection: Selection) {
     setSelected(selection); setStart(selection.item.startSeconds); setEnd(selection.item.endSeconds); setSaved(false);
-    if (playerReady) seekTo(Math.max(0, selection.item.startSeconds - 2));
+    if (playerReady) previewRange(selection.item.startSeconds, selection.item.endSeconds);
     setTimeout(() => reviewRef.current?.scrollIntoView({ behavior: "auto", block: "nearest" }), 0);
   }
 
@@ -182,15 +206,17 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
 
   return (
     <section className="rounded-lg border border-border bg-surface p-4 sm:p-5" aria-labelledby="ai-breakdown-heading">
+      <HighlightTimeline duration={duration} currentTime={currentTime} highlights={highlights} ready={playerReady} onSeek={seekTo}
+        selection={selected && validRange ? { startSeconds: start, endSeconds: end } : null} onSelect={(item) => inspect({ kind: "highlight", item })} />
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h3 id="ai-breakdown-heading" className="flex items-center gap-2 text-sm font-medium"><BrainCircuit size={16} className="text-accent" /> AI video breakdown</h3>
-          <p className="mt-1.5 max-w-lg text-xs leading-relaxed text-text-muted">AI watches the video, works out what kind of video it is, and suggests the highlights and spoken topics worth clipping.</p>
+          <p className="mt-1.5 max-w-lg text-xs leading-relaxed text-text-muted">Transcripts load automatically. AI analyzes the words and footage, then re-checks key moments and promising clips against the source.</p>
         </div>
         <span className="rounded bg-accent-soft px-2 py-1 text-[10px] text-accent">AI suggestions</span>
       </div>
 
-      {configured === false && <p className="mt-3 rounded-md bg-surface-raised p-3 text-xs text-text-muted">AI setup is needed: add GEMINI_API_KEY to .env.local, then run <code className="font-mono">npm run dev:all</code>.</p>}
+      {configured === false && <p className="mt-3 rounded-md bg-surface-raised p-3 text-xs text-text-muted">{setupMessage}</p>}
       {configured && !video.capabilities.canAnalyze && <p className="mt-3 text-xs text-text-muted">This source is not available for AI analysis. Choose a public video that allows embedding.</p>}
       {tooLong && <p className="mt-3 text-xs text-text-muted">Videos longer than two hours can&apos;t be analyzed yet.</p>}
 
@@ -203,8 +229,9 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
         {(active || pendingRetry) && jobId && <Button size="sm" onClick={cancel}>Cancel</Button>}
         <span className="text-[11px] text-text-muted">Up to 2 hours · uses your Gemini quota</span>
       </div>
-      <p className="mt-2 text-[11px] text-text-muted">The public video link is sent to Google Gemini, which analyzes its audio and frames. Results are kept for 24 hours.</p>
+      <p className="mt-2 text-[11px] text-text-muted">Analysis starts when you open a video. Transcript and video analysis use the configured services. Results are kept for 24 hours.</p>
       {error && <p role="alert" className="mt-3 text-xs text-danger">{error}</p>}
+      {Boolean(state?.transcriptSections?.length) && <TranscriptPanel sections={state!.transcriptSections!} ready={playerReady} onSeek={seekTo} />}
 
       {state && (
         <div className="mt-5" aria-live="polite">
@@ -212,11 +239,13 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
             <span>{statusText}</span>
             {state.totalWindows > 1 && <span className="font-mono text-text-muted">{formatTimecode(state.coveredSeconds)} / {formatTimecode(state.durationSeconds)}</span>}
           </div>
+          {state.status === "running" && state.phase && <p className="mt-1 text-xs text-accent" role="status">{{ fetching_transcript: "Fetching timestamped captions…", analyzing: "Finding key and potential moments…", verifying: "Checking suggested moments against the source…" }[state.phase]}</p>}
+          {state.transcriptNotice && <p className="mt-2 text-[11px] text-text-muted">{state.transcriptNotice}</p>}
           {state.totalWindows > 1
             ? <progress className="mt-2 h-1.5 w-full accent-accent" value={state.coveredSeconds} max={state.durationSeconds} aria-label="Video duration analyzed" />
-            : (active || pendingRetry) && <p className="mt-1 text-[11px] text-text-muted">The whole video is analyzed in one request, so there is no step-by-step progress. Longer videos take longer.</p>}
+            : (active || pendingRetry) && <p className="mt-1 text-[11px] text-text-muted">Existing captions are fetched, analyzed, and checked before highlights appear.</p>}
           {(active || pendingRetry) && workerOnline === false && (
-            <p className="mt-2 rounded-md bg-surface-raised p-2.5 text-xs text-text-muted">The analysis worker isn&apos;t running, so nothing is being analyzed. Start it with <code className="font-mono">npm run dev:all</code>, or run <code className="font-mono">npm run analysis:worker</code> in a second terminal.</p>
+            <p className="mt-2 rounded-md bg-surface-raised p-2.5 text-xs text-text-muted">The analysis worker isn&apos;t running, so nothing is being analyzed yet. It starts automatically with the website: restart <code className="font-mono">npm run dev</code> and check that terminal for worker errors, or run <code className="font-mono">npm run analysis:worker</code> in a second terminal.</p>
           )}
           {state.message && <p className="mt-2 text-xs text-danger">{state.message}</p>}
           {canRetry && <Button className="mt-2" size="sm" onClick={() => analyze(true)} icon={<RotateCcw size={12} />}>Retry missed sections</Button>}
@@ -254,19 +283,6 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
 
       {hasResults && state && (
         <>
-          <div className="relative mt-4 h-7 overflow-hidden rounded bg-surface-raised" aria-label="Highlights and topics timeline">
-            {topics.map((item, index) => (
-              <button key={`t-${index}`} type="button" onClick={() => inspect({ kind: "topic", item })} aria-label={`Topic ${item.title}, ${range(item)}`} title={item.title}
-                className={`absolute top-0 h-2 ${index % 2 ? "bg-text-faint/30" : "bg-text-faint/50"} hover:bg-text-muted focus-visible:bg-text-muted`}
-                style={{ left: `${(item.startSeconds / state.durationSeconds) * 100}%`, width: `${((item.endSeconds - item.startSeconds) / state.durationSeconds) * 100}%` }} />
-            ))}
-            {highlights.map((item, index) => (
-              <button key={`h-${index}`} type="button" onClick={() => inspect({ kind: "highlight", item })} aria-label={`${item.label}: ${item.title} at ${formatTimecode(item.startSeconds)}`} title={`${item.label}: ${item.title}`}
-                className={`absolute bottom-1 top-3 min-w-1 rounded-sm ${item.strength === "high" ? "bg-accent" : "bg-accent/50"} hover:bg-accent-strong focus-visible:bg-accent-strong`}
-                style={{ left: `${(item.startSeconds / state.durationSeconds) * 100}%`, width: `${((item.endSeconds - item.startSeconds) / state.durationSeconds) * 100}%` }} />
-            ))}
-          </div>
-
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <Chip active={tab === "highlights"} aria-pressed={tab === "highlights"} icon={<Sparkles size={12} />} onClick={() => setTab("highlights")}>Highlights ({highlights.length})</Chip>
             <Chip active={tab === "topics"} aria-pressed={tab === "topics"} icon={<ListTree size={12} />} onClick={() => setTab("topics")}>Topics ({topics.length})</Chip>
@@ -340,6 +356,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
         <div ref={reviewRef} className="mt-4 rounded-md border border-border-strong bg-surface-raised p-3">
           <p className="text-[10px] uppercase tracking-wide text-text-faint">{selected.kind === "highlight" ? `${selected.item.label} · ${selected.item.strength} clip potential` : "Topic chapter"}</p>
           <h4 className="mt-1 text-sm font-medium">{selected.item.title}</h4>
+          {Boolean(state?.transcriptSections?.length) && <TranscriptPanel sections={state!.transcriptSections!} start={start} end={end} ready={playerReady} onSeek={seekTo} />}
           <p className="mt-1 text-xs leading-relaxed text-text-muted">{selected.item.summary}</p>
           {selected.kind === "highlight" && (
             <p className="mt-2 text-xs text-text-muted">
@@ -350,11 +367,11 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved }: {
           <div className="mt-3 flex flex-wrap items-end gap-3">
             <label className="text-[11px] text-text-muted">Start (seconds)<input type="number" min="0" max={duration} step="0.1" value={start} onChange={(event) => { setStart(event.target.valueAsNumber); setSaved(false); }} className="mt-1 block w-24 rounded border border-border bg-bg px-2 py-1.5 text-xs text-text" /></label>
             <label className="text-[11px] text-text-muted">End (seconds)<input type="number" min="0" max={duration} step="0.1" value={end} onChange={(event) => { setEnd(event.target.valueAsNumber); setSaved(false); }} className="mt-1 block w-24 rounded border border-border bg-bg px-2 py-1.5 text-xs text-text" /></label>
-            <Button size="sm" disabled={!playerReady || !validRange} onClick={() => seekTo(Math.max(0, start - 2))} icon={<Play size={12} />}>Preview with lead-in</Button>
-            <Button size="sm" variant="primary" disabled={!validRange || saved} onClick={saveRange} icon={<Bookmark size={12} />}>{saved ? "Saved" : "Save range"}</Button>
+            <Button size="sm" disabled={!playerReady || !validRange} onClick={() => previewRange(Math.max(0, start - 2), end)} icon={<Play size={12} />}>Preview with lead-in</Button>
+            <Button size="sm" variant="primary" disabled={!validRange || saved} onClick={saveRange} icon={<Bookmark size={12} />}>{saved ? "Saved" : "Save raw clip selection"}</Button>
           </div>
           {!validRange && <p className="mt-2 text-xs text-danger">Choose a start before the end, within the video duration.</p>}
-          <p className="mt-2 text-[11px] text-text-muted">Saves a timestamp and range to Collections. Playback continues past the end, and this does not export a clip.</p>
+          <p className="mt-2 text-[11px] text-text-muted">Preview stops at the selected end. Save this source range to Collections; an MP4 export requires an uploaded media file.</p>
         </div>
       )}
     </section>
