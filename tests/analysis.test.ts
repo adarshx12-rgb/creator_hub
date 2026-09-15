@@ -20,7 +20,8 @@ import {
   analyzeSection, applyReview, choosePlan, planningSample, readerPrompt, snapToCues, validatePlan, validateReader,
 } from "../lib/analysis/pipeline.ts";
 import type { RoleRunner } from "../lib/analysis/pipeline.ts";
-import { fetchNativeTranscript, parseNativeTranscript, transcriptForWindow } from "../lib/analysis/transcript.ts";
+import { parseNativeTranscript, transcriptForWindow } from "../lib/analysis/transcript.ts";
+import { fetchSupadata, CaptionFailure } from "../lib/analysis/transcript-providers.ts";
 
 const whole = { index: 0, start: 0, inputStart: 0, end: 120 };
 const highlight = { start: "00:10", end: "00:30", label: "Drift", title: "Long drift through the corner", summary: "The car slides sideways for several seconds.", strength: "high", evidenceAt: "00:15", evidenceSource: "visual", evidence: "Rear wheels smoke as the car angles sideways." };
@@ -415,7 +416,8 @@ test("analysis needs captions and at least one model provider before a job can s
   const keys = { GEMINI_API_KEY: "test", YOUTUBE_API_KEY: "test", SUPADATA_API_KEY: "test" };
   assert.equal(schemas.analysisSetupMessage(keys), null);
   assert.equal(schemas.analysisSetupMessage({ ...keys, GEMINI_API_KEY: "", ANTHROPIC_API_KEY: "test" }), null);
-  assert.match(schemas.analysisSetupMessage({ ...keys, SUPADATA_API_KEY: "" })!, /SUPADATA_API_KEY/);
+  assert.equal(schemas.analysisSetupMessage({ ...keys, SUPADATA_API_KEY: "" }), null, "local captions do not need Supadata credits");
+  assert.match(schemas.analysisSetupMessage({ ...keys, SUPADATA_API_KEY: "", TRANSCRIPT_SELF_HOSTED: "0" })!, /SUPADATA_API_KEY/);
   assert.match(schemas.analysisSetupMessage({ ...keys, GEMINI_API_KEY: "" })!, /GEMINI_API_KEY or ANTHROPIC_API_KEY/);
 });
 
@@ -424,7 +426,7 @@ test("native captions use original-language timed cues and unavailable providers
   const originalKey = process.env.SUPADATA_API_KEY;
   try {
     delete process.env.SUPADATA_API_KEY;
-    assert.equal((await fetchNativeTranscript("abcdefghijk", 120, new AbortController().signal)).transcript, null);
+    await assert.rejects(fetchSupadata("abcdefghijk", new AbortController().signal, process.env), CaptionFailure);
     process.env.SUPADATA_API_KEY = "test-key";
     globalThis.fetch = async (input, init) => {
       const url = new URL(String(input));
@@ -435,14 +437,12 @@ test("native captions use original-language timed cues and unavailable providers
       assert.equal((init?.headers as Record<string, string>)["x-api-key"], "test-key");
       return Response.json({ lang: "en", content: [{ offset: 1000, duration: 2000, text: "Caption" }] });
     };
-    const native = await fetchNativeTranscript("abcdefghijk", 120, new AbortController().signal);
-    assert.equal(native.transcript?.segments[0].startSeconds, 1);
+    const native = parseNativeTranscript(await fetchSupadata("abcdefghijk", new AbortController().signal, process.env), 120);
+    assert.equal(native.segments[0].startSeconds, 1);
     globalThis.fetch = async () => Response.json({}, { status: 429 });
-    const fallback = await fetchNativeTranscript("abcdefghijk", 120, new AbortController().signal);
-    assert.equal(fallback.transcript, null);
-    assert.match(fallback.notice!, /could not be retrieved/);
+    await assert.rejects(fetchSupadata("abcdefghijk", new AbortController().signal, process.env), (error: unknown) => error instanceof CaptionFailure && error.code === "rate_limited");
     const abort = new AbortController(); abort.abort();
-    await assert.rejects(fetchNativeTranscript("abcdefghijk", 120, abort.signal));
+    await assert.rejects(fetchSupadata("abcdefghijk", abort.signal, process.env));
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.SUPADATA_API_KEY; else process.env.SUPADATA_API_KEY = originalKey;
@@ -468,9 +468,12 @@ test("jobs persist section progress, cancel and retry flags, heartbeat, and igno
   const queued = await store.getProgress(job);
   assert.equal(queued.status, "queued");
   assert.equal(queued.totalWindows, 2);
-  await store.writeProgress(job.id, { ...queued, status: "running", completedWindows: [0], coveredSeconds: 3600 });
+  const nextCaptionAttemptAt = new Date(Date.now() + 60000).toISOString();
+  await store.writeProgress(job.id, { ...queued, status: "running", completedWindows: [0], coveredSeconds: 3600, captionRetryCount: 2, nextCaptionAttemptAt });
   const restored = await store.getJob(job.id);
   assert.deepEqual((await store.getProgress(restored!)).completedWindows, [0]);
+  assert.equal((await store.getProgress(restored!)).nextCaptionAttemptAt, nextCaptionAttemptAt);
+  assert.equal((await store.getProgress(restored!)).captionRetryCount, 2);
   assert.equal(await store.getJob("../../.env.local"), null);
   assert.equal(await store.retryRequested(job.id), false);
   await store.requestRetry(job.id);
@@ -509,7 +512,7 @@ test("API enforces owner isolation, CSRF protection, source eligibility, idempot
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const api: Record<string, (request: unknown) => Promise<Response>> = {};
-  const mockEnv = { GEMINI_API_KEY: "mock", YOUTUBE_API_KEY: "mock", SUPADATA_API_KEY: "mock" };
+  const mockEnv = { GEMINI_API_KEY: "mock", YOUTUBE_API_KEY: "mock", SUPADATA_API_KEY: "mock", TRANSCRIPT_SELF_HOSTED: "0" };
   vm.runInNewContext(code, { exports: api, require: (name: string) => {
     if (!(name in dependencies)) throw new Error(`Unexpected dependency ${name}`);
     return dependencies[name];
@@ -531,12 +534,24 @@ test("API enforces owner isolation, CSRF protection, source eligibility, idempot
   const job = await store.createJob(owner, input.videoId, 120, 3600);
   const status = await api.GET(request("GET", `?id=${job.id}`));
   assert.equal(status.status, 200);
-  assert.equal((await status.json()).workerOnline, false);
-  assert.equal((await api.GET(request("GET", `?id=${job.id}`, undefined, "d".repeat(64)))).status, 404);
-  assert.equal((await api.DELETE(request("DELETE", `?id=${job.id}`, undefined, "d".repeat(64)))).status, 404);
+  const own = await status.json();
+  assert.deepEqual([own.workerOnline, own.canCancel, own.owner], [false, true, undefined], "the owner hash is never exposed");
+
+  // Analyses of public videos are shared: other visitors can find and read one, but not cancel it.
+  const shared = await api.GET(request("GET", `?id=${job.id}`, undefined, "d".repeat(64)));
+  assert.equal(shared.status, 200);
+  assert.equal((await shared.json()).canCancel, false);
+  assert.equal((await (await api.GET(request("GET", `?videoId=${input.videoId}`, undefined, ""))).json()).id, job.id);
+  assert.equal((await (await api.GET(request("GET", "?videoId=abcdefghijk"))).json()).id, null, "cancelled analyses are not offered");
+  assert.equal((await api.GET(request("GET", "?videoId=../../etc"))).status, 400);
+  assert.equal((await api.GET(request("GET", `?id=${randomUUID()}`))).status, 404);
+  assert.equal((await api.DELETE(request("DELETE", `?id=${job.id}`, undefined, "d".repeat(64)))).status, 403);
   assert.equal(await store.isCancelled(job.id), false);
   assert.equal((await api.POST(request("POST", "", input, token, "https://evil.example"))).status, 403);
   assert.equal((await (await api.POST(request("POST", "", input))).json()).id, job.id);
+  const joined = await api.POST(request("POST", "", input, "d".repeat(64)));
+  assert.equal((await joined.json()).id, job.id, "a second visitor joins the existing analysis instead of paying for another");
+  assert.equal((await store.listJobs()).filter((item) => item.videoId === input.videoId).length, 1);
   assert.equal((await api.POST(request("POST", "", { ...input, mode: "topics" }))).status, 400);
 
   // A partly failed analysis is returned as-is until the user asks to retry the missed sections.

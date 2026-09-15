@@ -66,6 +66,15 @@ export async function getJob(id: string) {
   return isCurrent(job) ? job : null;
 }
 
+/** The newest analysis of a video that wasn't cancelled. Every visitor shares it. */
+export async function latestJobForVideo(videoId: string) {
+  const jobs = (await listJobs()).filter((job) => job.videoId === videoId).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  for (const job of jobs) {
+    if ((await getProgress(job)).status !== "cancelled") return job;
+  }
+  return null;
+}
+
 export function emptyProgress(job: AnalysisJob): AnalysisProgress {
   return {
     status: "queued",

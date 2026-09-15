@@ -10,6 +10,7 @@ import type { Provider } from "../lib/analysis/models.ts";
 import { analyzeSection, choosePlan, planAnalysis, planningSample, visualPassMode } from "../lib/analysis/pipeline.ts";
 import type { RoleRunner } from "../lib/analysis/pipeline.ts";
 import { fetchNativeTranscript, transcriptForWindow } from "../lib/analysis/transcript.ts";
+import { captionRecovery, captionRetryDue } from "../lib/analysis/caption-recovery.ts";
 
 // A single local worker owns progress writes. Requests only create jobs and cancel/retry flags.
 // Sections run in parallel; each provider has its own request limit, so slow footage scans never hold
@@ -75,6 +76,7 @@ async function acquireLock() {
 }
 
 async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: Record<AnalysisRole, string[]>) {
+  if (!captionRetryDue(initial)) return;
   const windows = analysisWindows(job.durationSeconds, job.windowSeconds);
   const controller = new AbortController();
   controllers.add(controller);
@@ -83,7 +85,7 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: R
   }, 1000);
 
   // Sections finish concurrently, so progress updates are applied in memory and written in order.
-  let progress: AnalysisProgress = { ...initial, status: "running", message: undefined, startedAt: now(), finishedAt: undefined, updatedAt: now() };
+  let progress: AnalysisProgress = { ...initial, status: "running", message: undefined, nextCaptionAttemptAt: undefined, startedAt: now(), finishedAt: undefined, updatedAt: now() };
   let writes = Promise.resolve();
   const save = (update: (current: AnalysisProgress) => AnalysisProgress) => {
     progress = update(progress);
@@ -91,6 +93,7 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: R
     writes = writes.then(() => writeProgress(job.id, snapshot));
     return writes;
   };
+  try {
   await save((current) => current);
 
   let lastError: string | null = null;
@@ -141,6 +144,12 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: R
     });
     if (fetched) {
       if (!fetched.transcript) lastError = fetched.notice ?? "Existing captions are unavailable for this video.";
+      const recovery = !fetched.transcript ? captionRecovery(progress, fetched.retryAt, job.createdAt) : null;
+      if (recovery && !controller.signal.aborted && !stopping) {
+        await save((current) => ({ ...current, ...recovery, transcriptNotice: fetched.notice, updatedAt: now() }));
+        console.log(`Job ${job.id}: caption retry ${progress.captionRetryCount}/6 scheduled for ${progress.nextCaptionAttemptAt}.`);
+        return;
+      }
       await save((current) => ({ ...current, transcriptNotice: fetched.notice,
         transcriptSections: fetched.transcript ? windows.map((window) => transcriptForWindow(fetched.transcript!, window)) : [],
         failedWindows: fetched.transcript ? current.failedWindows : windows.map((window) => window.index),
@@ -211,8 +220,6 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: R
     await Promise.all(pending.map(runSection));
   }
 
-  clearInterval(cancelPoll);
-  controllers.delete(controller);
   await writes;
   if (stopping) return;
   if (await isCancelled(job.id)) {
@@ -231,6 +238,10 @@ async function processJob(job: AnalysisJob, initial: AnalysisProgress, models: R
     };
   });
   console.log(`Job ${job.id} finished: ${progress.status} in ${elapsed(Date.parse(progress.finishedAt!) - Date.parse(progress.startedAt!))}.`);
+  } finally {
+    clearInterval(cancelPoll);
+    controllers.delete(controller);
+  }
 }
 
 async function main() {
@@ -284,7 +295,8 @@ async function main() {
         if ((progress.status === "complete" || progress.status === "failed") && progress.failedWindows.length > 0 && await retryRequested(job.id)) {
           await clearRetryRequest(job.id);
           if (progress.retryRounds < MAX_RETRY_ROUNDS) {
-            progress = { ...progress, status: "queued", failedWindows: [], retryRounds: progress.retryRounds + 1, message: undefined };
+            progress = { ...progress, status: "queued", failedWindows: [], retryRounds: progress.retryRounds + 1,
+              captionRetryCount: 0, nextCaptionAttemptAt: undefined, message: undefined };
           }
         }
         if (progress.status === "queued" || progress.status === "running") await processJob(job, progress, models);

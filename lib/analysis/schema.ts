@@ -8,7 +8,10 @@ export const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 export const JOB_VERSION = 5;
 
 export function analysisSetupMessage(env: Record<string, string | undefined> = process.env): string | null {
-  const missing = ["YOUTUBE_API_KEY", "SUPADATA_API_KEY"].filter((name) => !env[name]);
+  const missing = ["YOUTUBE_API_KEY"].filter((name) => !env[name]);
+  if (/^(0|false|off)$/i.test(env.TRANSCRIPT_SELF_HOSTED?.trim() ?? "") && !env.SUPADATA_API_KEY?.trim()) {
+    missing.push("SUPADATA_API_KEY (or enable TRANSCRIPT_SELF_HOSTED)");
+  }
   if (!env.GEMINI_API_KEY && !env.ANTHROPIC_API_KEY) missing.push("GEMINI_API_KEY or ANTHROPIC_API_KEY");
   return missing.length ? `Connect existing YouTube captions and analysis by adding ${missing.join(", ")} to the server environment, then restart the website.` : null;
 }

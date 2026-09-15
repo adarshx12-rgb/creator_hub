@@ -103,6 +103,8 @@ export interface AnalysisProgress {
   phase?: "fetching_transcript" | "planning" | "analyzing";
   transcriptSections?: TranscriptSection[];
   transcriptNotice?: string;
+  captionRetryCount?: number;
+  nextCaptionAttemptAt?: string;
   plan?: AnalysisPlan;
   modelsByRole?: Partial<Record<AnalysisRole, string[]>>;
   /** Transcript moments the reviewer rejected as unsupported, misleading, duplicate or weak. */
@@ -130,6 +132,8 @@ export interface AnalysisState extends AnalysisProgress {
   id: string;
   durationSeconds: number;
   workerOnline: boolean;
+  /** Analyses are shared by video; only the visitor who started one can cancel it. */
+  canCancel: boolean;
 }
 
 const STRENGTH_RANK: Record<Strength, number> = { high: 3, medium: 2, low: 1 };

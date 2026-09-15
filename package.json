@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "analysis:worker": "node --env-file-if-exists=.env.local --experimental-strip-types scripts/analysis-worker.ts",
-    "test:analysis": "node --experimental-strip-types --test tests/analysis.test.ts"
+    "captions:check": "node --env-file-if-exists=.env.local --experimental-strip-types scripts/check-captions.ts",
+    "test:analysis": "node --experimental-strip-types --test tests/analysis.test.ts tests/transcript.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",

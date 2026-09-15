@@ -60,39 +60,30 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
   const [end, setEnd] = useState(0);
   const [saved, setSaved] = useState(false);
   const reviewRef = useRef<HTMLDivElement>(null);
-  const storageKey = `momentscout:analysis:v5:${video.provider}:${video.id}`;
   const active = Boolean(state && ACTIVE.includes(state.status));
   const busy = submitting || pendingRetry || active || Boolean(jobId && !state && !error);
 
+  // Opening a video spends nothing: it only looks up an analysis of this video that already exists.
   useEffect(() => {
     let current = true;
-    let stored: string | null = null;
-    try { stored = window.sessionStorage.getItem(storageKey); } catch { /* Storage optional. */ }
-    fetch("/api/analysis").then((res) => {
-      if (!res.ok) throw new Error("Analysis service unavailable");
-      return res.json();
-    }).then(async (data) => {
+    const lookup = video.provider === "youtube"
+      ? fetch(`/api/analysis?videoId=${encodeURIComponent(video.id)}`).then((res) => (res.ok ? res.json() : { id: null }))
+      : Promise.resolve({ id: null });
+    Promise.all([
+      fetch("/api/analysis").then((res) => {
+        if (!res.ok) throw new Error("Analysis service unavailable");
+        return res.json();
+      }),
+      lookup,
+    ]).then(([data, existing]) => {
       if (!current) return;
       setConfigured(data.configured === true);
       setSetupMessage(typeof data.setupMessage === "string" ? data.setupMessage : "Caption analysis is not connected yet.");
       setWorkerOnline(data.workerOnline === true);
-      if (!stored && data.configured && video.provider === "youtube" && video.capabilities.canAnalyze
-        && video.durationSeconds && video.durationSeconds <= MAX_VIDEO_SECONDS) {
-        setSubmitting(true);
-        try {
-          const id = await queueAnalysis(video);
-          try { window.sessionStorage.setItem(storageKey, id); } catch { /* Storage optional. */ }
-          if (current) setJobId(id);
-        } catch (caught) {
-          if (current) setError(caught instanceof Error ? caught.message : "Could not start analysis.");
-        } finally { if (current) setSubmitting(false); }
-      }
+      if (typeof existing.id === "string") setJobId(existing.id);
     }).catch(() => { if (current) setError("Could not check the analysis service. Refresh to retry."); });
-    // Restore only the job reference; analysis data stays in owner-scoped server storage.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setJobId(stored);
     return () => { current = false; };
-  }, [storageKey, video]);
+  }, [video]);
 
   useEffect(() => {
     if (!jobId) return;
@@ -104,7 +95,6 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
         const data = await response.json();
         if (controller.signal.aborted) return;
         if (response.status === 404) {
-          try { sessionStorage.removeItem(storageKey); } catch { /* Storage optional. */ }
           setJobId(null); setState(null); setPendingRetry(false); setError(data.message || "Analysis expired.");
           return;
         }
@@ -122,7 +112,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
     }
     void poll();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [jobId, storageKey, pendingRetry]);
+  }, [jobId, pendingRetry]);
 
   async function analyze(retryFailed = false) {
     setSubmitting(true); setError("");
@@ -131,7 +121,6 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
       if (retryFailed) setPendingRetry(true);
       else if (id !== jobId) { setState(null); setSelected(null); }
       setJobId(id);
-      try { sessionStorage.setItem(storageKey, id); } catch { /* Storage optional. */ }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not start analysis.");
     } finally {
@@ -200,7 +189,7 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
   const canRetry = state && !active && !pendingRetry && state.failedWindows.length > 0 && state.retryRounds < MAX_RETRY_ROUNDS;
 
   const statusText = !state ? "" : pendingRetry ? "Retrying missed sections…"
-    : state.status === "queued" ? "Queued"
+    : state.status === "queued" ? state.nextCaptionAttemptAt ? "Waiting to retry captions" : "Queued"
     : state.status === "running" ? (state.totalWindows > 1 ? `Analyzing ${state.totalWindows} sections in parallel · ${state.completedWindows.length} done…` : "Analyzing the video…")
     : state.status === "complete" ? (state.failedWindows.length ? "Partly analyzed" : "Analysis complete")
     : state.status === "failed" ? "Analysis failed" : "Cancelled";
@@ -233,10 +222,11 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
             {submitting ? "Starting…" : active || pendingRetry ? "Analyzing…" : state ? "Analyze again" : "Analyze video"}
           </Button>
         )}
-        {(active || pendingRetry) && jobId && <Button size="sm" onClick={cancel}>Cancel</Button>}
+        {(active || pendingRetry) && jobId && state?.canCancel && <Button size="sm" onClick={cancel}>Cancel</Button>}
         <span className="text-[11px] text-text-muted">Up to 2 hours · uses your configured AI services</span>
       </div>
-      <p className="mt-2 text-[11px] text-text-muted">Analysis starts when you open a video. Transcript and video analysis use the configured services. Results are kept for 24 hours.</p>
+      <p className="mt-2 text-[11px] text-text-muted">Nothing is analyzed until you choose Analyze video. Each video is analyzed once and shared with everyone who opens it for 24 hours.</p>
+      {active && state && !state.canCancel && <p className="mt-1 text-[11px] text-text-muted">Started by another visitor or browser. Results appear here as sections finish.</p>}
       {error && <p role="alert" className="mt-3 text-xs text-danger">{error}</p>}
       {Boolean(state?.transcriptSections?.length) && <TranscriptPanel sections={state!.transcriptSections!} ready={playerReady} onSeek={seekTo} />}
 
@@ -254,6 +244,9 @@ export function HighlightsPanel({ video, seekTo, playerReady, onSaved, currentTi
               : "Reading the transcript; spoken moments are cross-checked before they appear…",
           }[state.phase]}</p>}
           {state.transcriptNotice && <p className="mt-2 text-[11px] text-text-muted">{state.transcriptNotice}</p>}
+          {state.nextCaptionAttemptAt && active && <p className="mt-2 text-xs text-accent" role="status">
+            Automatic caption retry {state.captionRetryCount}/6 at {new Date(state.nextCaptionAttemptAt).toLocaleTimeString()}. You can leave this page; the worker will continue.
+          </p>}
           {state.plan && <p className="mt-2 text-[11px] text-text-muted">{state.plan.visualReason}</p>}
           {modelSummary && <p className="mt-1 text-[11px] text-text-faint">Models · {modelSummary}</p>}
           {runSeconds !== null && <p className="mt-1 text-[11px] text-text-faint">Latest run took {formatTimecode(runSeconds)}.</p>}

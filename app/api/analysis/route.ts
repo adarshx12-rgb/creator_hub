@@ -3,11 +3,12 @@ import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { NextRequest, NextResponse } from "next/server";
 import { CreateAnalysisSchema, MAX_RETRY_ROUNDS, MAX_VIDEO_SECONDS, analysisSetupMessage, clampWindowSeconds } from "@/lib/analysis/schema";
-import { analysisRoot, cancelJob, createJob, getJob, getProgress, isWorkerOnline, listJobs, requestRetry } from "@/lib/analysis/store";
+import { analysisRoot, cancelJob, createJob, getJob, getProgress, isWorkerOnline, latestJobForVideo, listJobs, requestRetry } from "@/lib/analysis/store";
 import { getYoutubeVideo } from "@/lib/youtube";
 
 export const runtime = "nodejs";
 const COOKIE = "momentscout-analysis";
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 function ownerOf(request: NextRequest) {
   const token = request.cookies.get(COOKIE)?.value;
   return token && /^[a-f0-9]{64}$/.test(token) ? createHash("sha256").update(token).digest("hex") : null;
@@ -34,14 +35,21 @@ async function smallBody(request: NextRequest) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
+// Analyses cover public videos, so they are shared: any visitor can find and read a video's current
+// analysis, which means each video costs captions and model quota once. Only its starter can cancel it.
 export async function GET(request: NextRequest) {
   const owner = ownerOf(request);
   const id = request.nextUrl.searchParams.get("id");
+  const videoId = request.nextUrl.searchParams.get("videoId");
   const workerOnline = await isWorkerOnline();
+  if (videoId !== null) {
+    if (!VIDEO_ID.test(videoId)) return reply({ message: "Supply a valid YouTube video ID." }, 400);
+    return reply({ id: (await latestJobForVideo(videoId))?.id ?? null });
+  }
   if (!id) return reply({ configured: !analysisSetupMessage(process.env), setupMessage: analysisSetupMessage(process.env), maxDurationSeconds: MAX_VIDEO_SECONDS, workerOnline });
   const job = await getJob(id);
-  if (!owner || !job || job.owner !== owner) return reply({ message: "Analysis not found or expired." }, 404);
-  return reply({ id: job.id, durationSeconds: job.durationSeconds, ...await getProgress(job), workerOnline });
+  if (!job) return reply({ message: "Analysis not found or expired." }, 404);
+  return reply({ id: job.id, durationSeconds: job.durationSeconds, ...await getProgress(job), workerOnline, canCancel: Boolean(owner && job.owner === owner) });
 }
 
 export async function POST(request: NextRequest) {
@@ -59,8 +67,8 @@ export async function POST(request: NextRequest) {
   catch { return reply({ message: "Another analysis is being queued. Try again shortly." }, 429); }
   try {
     const jobs = await listJobs();
-    const owned = jobs.filter((job) => job.owner === owner);
-    const sameVideo = owned.filter((job) => job.videoId === input.videoId).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+    // Joining an existing analysis of this video, whoever started it, costs nothing.
+    const sameVideo = jobs.filter((job) => job.videoId === input.videoId).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
     for (const existing of sameVideo) {
       const state = await getProgress(existing);
       if (state.status === "queued" || state.status === "running") return reply({ id: existing.id });
@@ -76,6 +84,7 @@ export async function POST(request: NextRequest) {
       }
       // Cancelled or fully failed analyses fall through to a fresh job.
     }
+    const owned = jobs.filter((job) => job.owner === owner);
     if (owned.length >= 6 || jobs.length >= 20) return reply({ message: "The daily analysis limit has been reached. Try again after older jobs expire." }, 429);
     const states = await Promise.all(owned.map(getProgress));
     if (states.some((state) => state.status === "running" || state.status === "queued")) return reply({ message: "Finish or cancel your current analysis before starting another." }, 409);
@@ -95,7 +104,8 @@ export async function DELETE(request: NextRequest) {
   const id = request.nextUrl.searchParams.get("id");
   const owner = ownerOf(request);
   const job = id ? await getJob(id) : null;
-  if (!owner || !job || job.owner !== owner) return reply({ message: "Analysis not found or expired." }, 404);
+  if (!job) return reply({ message: "Analysis not found or expired." }, 404);
+  if (!owner || job.owner !== owner) return reply({ message: "Only the visitor who started this analysis can cancel it." }, 403);
   await cancelJob(job.id);
   return reply({ status: "cancelled" });
 }
