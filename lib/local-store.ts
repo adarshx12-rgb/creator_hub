@@ -103,3 +103,9 @@ export function removeExportJob(id: string): ExportJob[] {
   write(EXPORT_JOBS_KEY, next);
   return next;
 }
+
+export function updateExportJob(id: string, patch: Partial<ExportJob>): ExportJob[] {
+  const next = getExportJobs().map(job => job.id === id ? { ...job, ...patch } : job);
+  write(EXPORT_JOBS_KEY, next);
+  return next;
+}

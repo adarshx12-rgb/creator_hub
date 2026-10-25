@@ -109,9 +109,12 @@ export interface TrimSelection {
   crop: CropMode;
 }
 
-export type JobStatus = "queued" | "blocked" | "failed";
+export type JobStatus = "queued" | "blocked" | "failed" | "uploading" | "rendering" | "complete" | "cancelled";
 
 export interface ExportJob {
+  renderId?: string;
+  progress?: number;
+  captions?: { cues: import("./captions").CaptionCue[]; design: import("./captions").CaptionDesign };
   id: string;
   assetId: string;
   assetName: string;

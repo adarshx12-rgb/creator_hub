@@ -7,12 +7,15 @@ import { PlayerPanel } from "./PlayerPanel";
 import { SourcePanel } from "./SourcePanel";
 import { MomentsPanel } from "./MomentsPanel";
 import { HighlightsPanel } from "./HighlightsPanel";
+import { ClipDownloadPanel } from "./ClipDownloadPanel";
 import { useYoutubePlayer } from "./useYoutubePlayer";
 import type { SearchResult } from "@/lib/types";
 
-export function VideoDetailView({ video, initialSeconds }: { video: SearchResult; initialSeconds?: number }) {
+export function VideoDetailView({ video, initialSeconds, downloadsEnabled = false }: {
+  video: SearchResult; initialSeconds?: number; downloadsEnabled?: boolean;
+}) {
   const [savedRevision, setSavedRevision] = useState(0);
-  const { containerRef, ready, getCurrentTime, seekTo, currentTime, previewRange } = useYoutubePlayer(
+  const { containerRef, ready, getCurrentTime, seekTo, currentTime, previewRange, scrubTo } = useYoutubePlayer(
     video.id,
     video.provider === "youtube" && video.capabilities.canPreview,
     initialSeconds,
@@ -32,6 +35,11 @@ export function VideoDetailView({ video, initialSeconds }: { video: SearchResult
       <div className="grid gap-6 lg:grid-cols-[1fr_440px]">
         <div className="lg:sticky lg:top-6 lg:self-start">
           <PlayerPanel video={video} containerRef={containerRef} initialSeconds={initialSeconds} />
+          {downloadsEnabled && video.provider === "youtube" && (
+            <div className="mt-4">
+              <ClipDownloadPanel key={video.id} video={video} currentTime={currentTime} playerReady={ready} scrubTo={scrubTo} previewRange={previewRange} />
+            </div>
+          )}
         </div>
         <div className="space-y-4 lg:sticky lg:top-6 lg:max-h-[calc(100vh-3rem)] lg:self-start lg:overflow-y-auto lg:overscroll-contain lg:pr-1">
           <HighlightsPanel key={`${video.provider}:${video.id}`} video={video} seekTo={seekTo} currentTime={currentTime} previewRange={previewRange} playerReady={ready} onSaved={() => setSavedRevision((value) => value + 1)} />

@@ -80,7 +80,8 @@ For YouTube discovery results:
 - A timestamp link is not an official YouTube Clip and does not enforce an ending timestamp; label it correctly.
 - Users may open YouTube and use its native Clip feature where available, then save the resulting official Clip link.
 - Do not fabricate official Clip URLs or assume a public Clip creation endpoint exists.
-- Do not scrape streams, extract hidden media URLs, add downloaders, or redirect users to third-party download sites as a workaround.
+- Do not scrape streams, extract hidden media URLs, or redirect users to third-party download sites as a workaround, except through the personal-use download mode below.
+- Personal-use download mode (owner's local machine only): a yt-dlp integration may download a user-chosen time range of a YouTube video as MP4. It must stay off unless `PERSONAL_DOWNLOADS=1`, refuse non-localhost requests, run yt-dlp with argument arrays (never shell strings), validate 0 <= start < end <= duration, cap clip length, dedupe repeated requests, and expire files. Keep it clearly labeled "Personal use"; never enable it in a public deployment or expose it to other users. Downloaded YouTube files are not authorized uploads and must not gain analysis/export capabilities or rights records by default.
 - An official Clip is a sharing mechanism, not an MP4 export permission.
 
 For authorized uploads and licensed/partner footage:

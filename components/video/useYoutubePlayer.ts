@@ -73,6 +73,13 @@ export function useYoutubePlayer(videoId: string, enabled: boolean, startSeconds
     playerRef.current?.seekTo(seconds, true);
     playerRef.current?.playVideo();
   }, []);
+  // Scrubbing shows the frame at a position without starting playback.
+  const scrubTo = useCallback((seconds: number) => {
+    previewEnd.current = null;
+    playerRef.current?.pauseVideo();
+    playerRef.current?.seekTo(seconds, true);
+    setCurrentTime(seconds);
+  }, []);
   const previewRange = useCallback((start: number, end: number) => {
     if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) return;
     previewEnd.current = end;
@@ -117,6 +124,7 @@ export function useYoutubePlayer(videoId: string, enabled: boolean, startSeconds
     ready,
     currentTime,
     previewRange,
+    scrubTo,
     getCurrentTime: () => playerRef.current?.getCurrentTime() ?? 0,
     seekTo,
   };

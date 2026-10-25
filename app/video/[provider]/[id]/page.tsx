@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { VideoDetailView } from "@/components/video/VideoDetailView";
 import { SetupRequiredPanel } from "@/components/results/StatusPanel";
 import { getYoutubeVideo } from "@/lib/youtube";
+import { downloadsEnabled } from "@/lib/personal-download";
 import { getTwitchClip, getTwitchVideo } from "@/lib/twitch";
 import type { Provider } from "@/lib/types";
 
@@ -51,5 +52,5 @@ export default async function VideoPage({
 
   const initialSeconds = t ? Number(t) : undefined;
 
-  return <VideoDetailView video={video} initialSeconds={Number.isFinite(initialSeconds) ? initialSeconds : undefined} />;
+  return <VideoDetailView video={video} initialSeconds={Number.isFinite(initialSeconds) ? initialSeconds : undefined} downloadsEnabled={downloadsEnabled()} />;
 }
